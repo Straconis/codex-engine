@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules
+dist
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+src-tauri/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# SQLite runtime DB (do NOT commit user data)
+*.sqlite3
+*.db
+
+# IDE
+.vscode
+.idea

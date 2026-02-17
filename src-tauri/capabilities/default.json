@@ -1,0 +1,16 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for codex-engine (dialog + opener + events).",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "dialog:allow-open",
+    "opener:allow-open-path",
+    "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir"
+  ]
+}
