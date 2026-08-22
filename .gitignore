@@ -25,3 +25,17 @@ Thumbs.db
 # IDE
 .vscode
 .idea
+
+# Python backend runtime
+backend/.venv/
+backend/uploads/
+__pycache__/
+*.pyc
+
+# Generated release/build artifacts
+/release/
+/resources/backend/
+/resources/updater/
+/backend/build/
+/backend/dist/
+/backend/*.spec

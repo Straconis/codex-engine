@@ -1,27 +1,75 @@
 {
   "name": "codex-engine",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "desktop": "electron .",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "backend": "python -m uvicorn codex_engine.app:app --app-dir backend --host 127.0.0.1 --port 8787 --reload",
+    "build:backend:win": "powershell -ExecutionPolicy Bypass -File scripts/build-backend-win.ps1",
+    "package:win": "electron-builder --win",
+    "dist:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",
+    "package:dir": "electron-builder --win dir",
+    "installer:inno": "powershell -ExecutionPolicy Bypass -File scripts/build-installer-inno.ps1",
+    "dist:win:inno": "powershell -ExecutionPolicy Bypass -File scripts/dist-win-inno.ps1",
+    "build:updater:win": "powershell -ExecutionPolicy Bypass -File scripts/build-updater-win.ps1"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "electron": "^37.3.1",
+    "electron-builder": "^26.0.12"
+  },
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.codexengine.app",
+    "productName": "Codex Engine",
+    "files": [
+      "dist/**",
+      "electron/**",
+      "assets/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/backend",
+        "to": "backend"
+      },
+      {
+        "from": "resources/updater",
+        "to": "updater"
+      }
+    ],
+    "win": {
+      "icon": "assets/icons-v2/codex-engine-v2.ico",
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "icon": "assets/icons-v2/codex-engine-v2-512.png"
+    },
+    "linux": {
+      "icon": "assets/icons-v2/codex-engine-v2-512.png",
+      "target": "AppImage"
+    }
+  },
+  "allowScripts": {
+    "electron@37.10.3": true,
+    "esbuild@0.27.3": true,
+    "electron-winstaller@5.4.0": true
   }
 }

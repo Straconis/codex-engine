@@ -1,47 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { api, type DuplicateDetectedPayload, type IngestProgress, type SearchRow, type SourceRow, type VersionInfo } from "./api";
+import appLogo from "../assets/codex-engine-logo-1024.png";
 
-type SourceRow = {
-  id: number;
-  title: string;
-  path: string;
-  sha256: string;
-  pages: number;
-  enabled: number; // 0/1
-};
+const FRONTEND_VERSION = import.meta.env.PACKAGE_VERSION ?? "dev";
 
-type SearchRow = {
-  source_id: number;
-  source_title: string;
-  source_path: string;
-  page_num: number;
-  heading: string | null;
-  snippet: string;
-  loc: string | null;
-};
-
-type IngestProgress = {
-  id: number;
-  stage: string;
-  message: string;
-  current: number;
-  total: number;
-  done: boolean;
-  error?: string | null;
-};
-
-type DuplicateDetectedPayload = {
-  ingest_id: number;
-  new_path: string;
-  new_title?: string;
-  sha256?: string;
-  existing_id: number;
-  existing_title: string;
-  existing_path: string;
-};
-
+function pickPdfFile(): Promise<File | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/pdf,.pdf";
+    input.onchange = () => resolve(input.files?.[0] ?? null);
+    input.oncancel = () => resolve(null);
+    input.click();
+  });
+}
 function clampSnippet(s: string, max = 280) {
   const t = (s ?? "").replace(/\s+/g, " ").trim();
   if (t.length <= max) return t;
@@ -50,31 +22,6 @@ function clampSnippet(s: string, max = 280) {
 
 function formatPath(p: string) {
   return p.length > 70 ? "…" + p.slice(-67) : p;
-}
-
-async function pickPdfPath(): Promise<string | null> {
-  // Tauri v2 dialog plugin returns `FilePath` (often a string path) or null.
-  const picked: any = await open({
-    multiple: false,
-    directory: false,
-    filters: [{ name: "PDF", extensions: ["pdf"] }],
-    title: "Select a PDF to ingest",
-  });
-
-  if (!picked) return null;
-
-  // Common shapes: string, { path: string }, array variants
-  if (typeof picked === "string") return picked;
-  if (Array.isArray(picked)) {
-    const first = picked[0];
-    if (!first) return null;
-    if (typeof first === "string") return first;
-    if (typeof first?.path === "string") return first.path;
-    return String(first);
-  }
-  if (typeof picked?.path === "string") return picked.path;
-
-  return String(picked);
 }
 
 export default function App() {
@@ -86,6 +33,8 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchRow[]>([]);
   const [status, setStatus] = useState<string>("");
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
 
   // Ingest modal state
   const [ingestOpen, setIngestOpen] = useState(false);
@@ -97,7 +46,7 @@ export default function App() {
   const [dup, setDup] = useState<DuplicateDetectedPayload | null>(null);
   const [dupOpen, setDupOpen] = useState(false);
 
-  // Logging controls (frontend-only UI toggle; backend logging is configured via env/tauri side)
+  // Logging controls for frontend diagnostics.
   const [logToConsole, setLogToConsole] = useState(true);
   const [logToFile, setLogToFile] = useState(false);
   const lastLogFlush = useRef<number>(0);
@@ -112,14 +61,14 @@ export default function App() {
       // throttle to avoid spam if user leaves it on
       if (now - lastLogFlush.current > 250) {
         lastLogFlush.current = now;
-        invoke("log_line", { args: { line: msg } }).catch(() => {});
+        console.debug(msg);
       }
     }
   }
 
   async function refreshSources() {
     try {
-      const rows = await invoke<SourceRow[]>("list_sources");
+      const rows = await api.listSources();
       setSources(rows);
     } catch (e: any) {
       setStatus(`Failed to load sources: ${String(e)}`);
@@ -135,42 +84,48 @@ export default function App() {
 
   useEffect(() => {
     refreshSources();
+    api
+      .getVersion()
+      .then((version) => setVersionInfo({ ...version, frontend_version: FRONTEND_VERSION }))
+      .catch((e: any) => setStatus(`Version check failed: ${String(e)}`));
 
-    let unlistenProgress: (() => void) | null = null;
-    let unlistenDup: (() => void) | null = null;
+    const events = new EventSource(api.eventsUrl);
 
-    listen<IngestProgress>("ingest_progress", (event) => {
-      const p = event.payload;
+    events.addEventListener("ingest_progress", (event) => {
+      const p = JSON.parse((event as MessageEvent).data) as IngestProgress;
       setProgress(p);
       uiLog(`ingest_progress id=${p.id} stage=${p.stage} ${p.current}/${p.total} done=${p.done} msg=${p.message}`);
-      // Track ingestId if we didn't have one (rare, but helps recover if user opens modal late)
-      if (ingestId == null && typeof p.id === "number") setIngestId(p.id);
+      if (typeof p.id === "number") setIngestId((current) => current ?? p.id);
+      if (p.done) refreshSources();
+    });
 
-      if (p.done) {
-        // Always refresh sources on completion (success or error)
-        refreshSources();
-      }
-    }).then((f) => (unlistenProgress = f));
-
-    listen<DuplicateDetectedPayload>("duplicate_detected", (event) => {
-      uiLog(`duplicate_detected for ingest_id=${event.payload.ingest_id} existing_id=${event.payload.existing_id}`);
-      setDup(event.payload);
+    events.addEventListener("duplicate_detected", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as DuplicateDetectedPayload;
+      uiLog(`duplicate_detected for ingest_id=${payload.ingest_id} existing_id=${payload.existing_id}`);
+      setDup(payload);
       setDupOpen(true);
       setIngestOpen(true);
-      setStatus("Duplicate detected — choose what to do.");
-      // Keep progress modal open; user action will resume worker.
-    }).then((f) => (unlistenDup = f));
+      setStatus("Duplicate detected - choose what to do.");
+    });
+
+    events.onerror = () => {
+      uiLog("backend event stream disconnected");
+    };
+
+    const requestShutdown = () => {
+      api.requestShutdown();
+    };
+    window.addEventListener("beforeunload", requestShutdown);
 
     return () => {
-      unlistenProgress?.();
-      unlistenDup?.();
+      window.removeEventListener("beforeunload", requestShutdown);
+      events.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [logToConsole, logToFile]);
 
   async function toggleSourceEnabled(sourceId: number, enabled: boolean) {
     try {
-      await invoke("set_source_enabled", { sourceId, source_id: sourceId, enabled });
+      await api.setSourceEnabled(sourceId, enabled);
       await refreshSources();
     } catch (e: any) {
       setStatus(`Failed to update source: ${String(e)}`);
@@ -180,7 +135,7 @@ export default function App() {
   async function deleteSource(sourceId: number) {
     if (!confirm("Delete this source and all its chunks?")) return;
     try {
-      await invoke("delete_source", { sourceId, source_id: sourceId });
+      await api.deleteSource(sourceId);
       await refreshSources();
       setResults((r) => r.filter((x) => x.source_id !== sourceId));
     } catch (e: any) {
@@ -194,7 +149,7 @@ export default function App() {
 
     try {
       setStatus("Searching…");
-      const rows = await invoke<SearchRow[]>("search", { query: q });
+      const rows = await api.search(q);
       setResults(rows);
       setStatus(rows.length ? `Found ${rows.length} result(s).` : "No results.");
     } catch (e: any) {
@@ -202,14 +157,51 @@ export default function App() {
     }
   }
 
+  async function checkForUpdates() {
+    try {
+      setCheckingUpdates(true);
+      setStatus("Checking GitHub for updates...");
+      const update = await api.checkForUpdate();
+
+      if (update.status === "current") {
+        setStatus(`Codex Engine is up to date (${update.current_version}).`);
+        return;
+      }
+
+      if (update.status === "no_release") {
+        setStatus("No GitHub release is published yet. Create a release and attach the CodexEngineSetup installer to enable updates.");
+        return;
+      }
+
+      if (update.status === "missing_installer") {
+        setStatus(`Version ${update.latest_version} is available, but no ${update.platform ?? "current platform"} installer asset was found${update.expected_asset ? ` (${update.expected_asset})` : ""}.`);
+        return;
+      }
+
+      if (update.status === "update_available") {
+        const shouldUpdate = confirm(
+          `Codex Engine ${update.latest_version} is available. Download and install it now? The app will close while updating.`
+        );
+        if (!shouldUpdate) {
+          setStatus(`Update ${update.latest_version} is available.`);
+          return;
+        }
+
+        setStatus(`Downloading Codex Engine ${update.latest_version}...`);
+        await api.applyUpdate(update);
+        setStatus("Updater launched. Codex Engine will close to finish updating.");
+        setTimeout(() => window.close(), 750);
+      }
+    } catch (e: any) {
+      setStatus(`Update check failed: ${String(e)}`);
+    } finally {
+      setCheckingUpdates(false);
+    }
+  }
+
   async function openResult(r: SearchRow) {
     try {
-      await invoke("open_pdf_at_location", {
-        args: {
-          path: r.source_path,
-          page: r.page_num,
-        },
-      });
+      await api.openPdfAtLocation(r.source_path, r.page_num);
     } catch (e: any) {
       setStatus(`Open failed: ${String(e)}`);
     }
@@ -229,8 +221,7 @@ export default function App() {
         error: null,
       });
 
-      // IMPORTANT: Rust expects { args: { path } } for StartIngestArgs
-      const id = await invoke<number>("start_ingest_pdf", { args: { path } });
+      const { id } = await api.startIngest(path);
       setIngestId(id);
       setStatus(`Ingest queued (#${id}).`);
       uiLog(`start_ingest_pdf -> ${id}`);
@@ -248,13 +239,45 @@ export default function App() {
     }
   }
 
+  async function startIngestWithFile(file: File) {
+    try {
+      setStatus("Uploading PDF...");
+      setIngestId(null);
+      setIngestPath(file.name);
+      setIngestOpen(true);
+      setProgress({
+        id: -1,
+        stage: "upload",
+        message: "Uploading...",
+        current: 0,
+        total: 1,
+        done: false,
+        error: null,
+      });
+      const { id, path } = await api.uploadAndIngest(file);
+      setIngestId(id);
+      setIngestPath(path);
+      setStatus(`Ingest queued (#${id}).`);
+      uiLog(`upload_and_ingest -> ${id}`);
+    } catch (e: any) {
+      setStatus(`Upload failed: ${String(e)}`);
+      setProgress({
+        id: ingestId ?? -1,
+        stage: "error",
+        message: "Upload failed",
+        current: 0,
+        total: 0,
+        done: true,
+        error: String(e),
+      });
+    }
+  }
+
   async function onPickAndIngest() {
     try {
-      const p = await pickPdfPath();
-      if (!p) return;
-      setIngestPath(p);
-      setIngestOpen(true);
-      await startIngestWithPath(p);
+      const file = await pickPdfFile();
+      if (!file) return;
+      await startIngestWithFile(file);
     } catch (e: any) {
       setStatus(`File picker failed: ${String(e)}`);
     }
@@ -266,7 +289,7 @@ export default function App() {
       return;
     }
     try {
-      await invoke("cancel_ingest", { ingestId });
+      await api.cancelIngest(ingestId);
       setStatus("Cancel requested.");
     } catch (e: any) {
       setStatus(`Cancel failed: ${String(e)}`);
@@ -276,10 +299,7 @@ export default function App() {
   async function resolveDuplicate(action: "discard" | "replace" | "new_copy") {
     if (!dup) return;
     try {
-      // IMPORTANT: Rust expects { args: { ingest_id, action } }
-      await invoke("resolve_duplicate", {
-        args: { ingest_id: dup.ingest_id, action },
-      });
+      await api.resolveDuplicate(dup.ingest_id, action);
       setDupOpen(false);
       setStatus(
         action === "discard"
@@ -338,8 +358,22 @@ export default function App() {
           gap: 12px;
         }
 
-        .title h1 { margin: 0; font-size: 38px; letter-spacing: -0.02em; }
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          min-width: 0;
+        }
+        .brandLogo {
+          width: 56px;
+          height: 56px;
+          object-fit: contain;
+          flex: 0 0 auto;
+          filter: drop-shadow(0 5px 14px rgba(0,0,0,0.30));
+        }
+        .title h1 { margin: 0; font-size: 38px; letter-spacing: -0.02em; line-height: 1; }
         .title .sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
+        .versionLine { margin-top: 5px; color: var(--muted); opacity: 0.82; font-size: 11px; }
 
         .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
         .btn {
@@ -352,6 +386,7 @@ export default function App() {
           box-shadow: none;
         }
         .btn:hover { border-color: rgba(255,255,255,0.20); }
+        .btn:disabled { opacity: 0.55; cursor: not-allowed; }
         .btn.primary { background: var(--accent); border-color: transparent; color: #0b0f14; font-weight: 600; }
         .btn.danger { background: transparent; border-color: rgba(239,68,68,0.55); color: var(--danger); }
         .btn.small { padding: 6px 10px; border-radius: 9px; font-size: 12px; }
@@ -477,10 +512,16 @@ export default function App() {
       `}</style>
 
       <div className="topbar">
-        <div className="title">
-          <h1>Codex Engine</h1>
-          <div className="sub">
-            Rulebook library (local) • Active sources: {enabledCount}/{selectedCount}
+        <div className="brand">
+          <img className="brandLogo" src={appLogo} alt="" aria-hidden="true" />
+          <div className="title">
+            <h1>Codex Engine</h1>
+            <div className="sub">
+              Rulebook library (local) • Active sources: {enabledCount}/{selectedCount}
+            </div>
+            <div className="versionLine" title={versionInfo?.updater_path ?? "Updater path unavailable"}>
+              UI {FRONTEND_VERSION} • API {versionInfo?.backend_version ?? "..."} • Updater {versionInfo?.updater_version ?? "..."}{versionInfo ? ` • ${versionInfo.platform}${versionInfo.updater_present ? "" : " • updater missing"}` : ""}
+            </div>
           </div>
         </div>
 
@@ -490,6 +531,9 @@ export default function App() {
           </button>
           <button className="btn" onClick={refreshSources}>
             Refresh
+          </button>
+          <button className="btn" onClick={checkForUpdates} disabled={checkingUpdates}>
+            {checkingUpdates ? "Checking..." : "Check for Updates"}
           </button>
 
           <button className="btn" onClick={() => setDark((d) => !d)}>
@@ -655,11 +699,11 @@ export default function App() {
                 <button
                   className="btn"
                   onClick={async () => {
-                    const p = await pickPdfPath();
-                    if (p) setIngestPath(p);
+                    const file = await pickPdfFile();
+                    if (file) await startIngestWithFile(file);
                   }}
                 >
-                  Browse…
+                  Upload PDF
                 </button>
                 <button
                   className="btn primary"
@@ -761,4 +805,10 @@ export default function App() {
     </div>
   );
 }
+
+
+
+
+
+
 
