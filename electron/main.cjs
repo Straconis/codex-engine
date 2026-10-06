@@ -402,6 +402,22 @@ ipcMain.handle("codex-engine:pick-file", async (_event, defaultPath) => {
   return result.canceled ? null : result.filePaths[0] ?? null;
 });
 
+// Settings > "Uninstall Codex Engine...": start the installed uninstaller, then quit so it
+// can remove the app's files. Returns an error message, or null when it started.
+ipcMain.handle("codex-engine:uninstall", async () => {
+  const uninstaller = path.join(path.dirname(process.execPath), "unins000.exe");
+  if (!isPackaged || !fs.existsSync(uninstaller)) {
+    return "The uninstaller is only available in the installed app.";
+  }
+  try {
+    spawn(uninstaller, [], { detached: true, stdio: "ignore" }).unref();
+  } catch (error) {
+    return `Couldn't start the uninstaller: ${String(error)}`;
+  }
+  setTimeout(() => app.quit(), 300);
+  return null;
+});
+
 let uiLogPath = null;
 ipcMain.on("codex-engine:renderer-log-file", (_event, line) => {
   try {

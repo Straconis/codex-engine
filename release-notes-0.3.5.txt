@@ -1,0 +1,3 @@
+Installing or uninstalling now closes a running Codex Engine for you (including its backend and Ollama). Before, the installer's "close automatically" option failed and the app had to be closed by hand.
+The Start menu's Codex Engine folder now also has "Codex Engine Data Folder" (your library, settings and logs). With two apps in it, Windows keeps it as a folder, so "Uninstall Codex Engine" shows up there.
+Settings > General has an "Uninstall Codex Engine..." button.

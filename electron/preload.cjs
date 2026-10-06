@@ -24,6 +24,9 @@ contextBridge.exposeInMainWorld("codexEngine", {
   pickFile(defaultPath) {
     return ipcRenderer.invoke("codex-engine:pick-file", defaultPath ? String(defaultPath) : "");
   },
+  uninstall() {
+    return ipcRenderer.invoke("codex-engine:uninstall");
+  },
 });
 
 contextBridge.exposeInMainWorld("codexConsole", {

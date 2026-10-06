@@ -344,6 +344,26 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                 Write UI logs to a file (logs/ui.log)
               </label>
             </div>
+            {window.codexEngine?.uninstall && (
+              <div className="field">
+                <span>Remove Codex Engine</span>
+                <div className="row">
+                  <span className="hint">
+                    Also in the Start menu (Codex Engine folder) and Windows Settings &gt; Apps.
+                  </span>
+                  <button
+                    className="btn small danger"
+                    onClick={async () => {
+                      if (!confirm("Uninstall Codex Engine? The app will close and the uninstaller will start.")) return;
+                      const problem = await window.codexEngine!.uninstall!();
+                      if (problem) setError(problem);
+                    }}
+                  >
+                    Uninstall Codex Engine…
+                  </button>
+                </div>
+              </div>
+            )}
           </fieldset>
 
           {error && <div className="readerError">{error}</div>}

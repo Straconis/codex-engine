@@ -146,6 +146,7 @@ declare global {
       logToFile?(line: string): void;
       pickFolder?(defaultPath?: string): Promise<string | null>;
       pickFile?(defaultPath?: string): Promise<string | null>;
+      uninstall?(): Promise<string | null>; // error message, or null once the uninstaller started
     };
   }
 }
