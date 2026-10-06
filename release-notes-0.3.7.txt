@@ -1,0 +1,1 @@
+After an update, Codex Engine now deletes the downloaded installer (about 130 MB) and the temporary updater copy from the Temp folder, so updates no longer pile up on the C: drive.

@@ -178,3 +178,31 @@ def launch_updater(installer_path: str) -> None:
         raise RuntimeError(f"Codex Engine executable could not be found: {app_exe}")
 
     subprocess.Popen([updater_path, installer_path, app_exe], cwd=str(Path(updater_path).parent))
+
+
+def cleanup_update_files(max_age_seconds: float = 120.0) -> int:
+    """Delete leftovers of earlier updates; returns the number of bytes freed.
+
+    The downloaded installer (%TEMP%/CodexEngineUpdate) and the temporary updater copy
+    (%TEMP%/CodexEngineUpdater) are only needed while an update runs. Called at startup,
+    after any update has finished. Files younger than max_age_seconds, or still in use
+    (the updater that just relaunched us), are left for next time.
+    """
+    import time
+
+    freed = 0
+    now = time.time()
+    for folder in ("CodexEngineUpdate", "CodexEngineUpdater"):
+        directory = Path(tempfile.gettempdir()) / folder
+        if not directory.is_dir():
+            continue
+        for item in directory.iterdir():
+            try:
+                if not item.is_file() or now - item.stat().st_mtime < max_age_seconds:
+                    continue
+                size = item.stat().st_size
+                item.unlink()
+                freed += size
+            except OSError:
+                continue  # in use or already gone: try again next start
+    return freed

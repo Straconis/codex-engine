@@ -172,3 +172,31 @@ def test_default_viewer_lookup_on_windows():
 
     viewer = default_pdf_viewer_windows()
     assert viewer is None or viewer.lower().endswith(".exe")
+
+
+# ---- update leftovers -------------------------------------------------------------
+
+def test_old_update_files_are_cleaned_up(tmp_path, monkeypatch):
+    import os
+    import time
+
+    from codex_engine.updater import update_client
+
+    monkeypatch.setattr(update_client.tempfile, "gettempdir", lambda: str(tmp_path))
+    download = tmp_path / "CodexEngineUpdate"
+    copies = tmp_path / "CodexEngineUpdater"
+    download.mkdir()
+    copies.mkdir()
+    old_installer = download / "CodexEngineSetup-0.3.6.exe"
+    old_installer.write_bytes(b"x" * 1000)
+    old_copy = copies / "CodexEngineUpdater-abc.exe"
+    old_copy.write_bytes(b"y" * 200)
+    fresh = download / "CodexEngineSetup-0.3.7.exe.part"  # an update downloading right now
+    fresh.write_bytes(b"z" * 50)
+    old = time.time() - 3600
+    os.utime(old_installer, (old, old))
+    os.utime(old_copy, (old, old))
+
+    assert update_client.cleanup_update_files() == 1200
+    assert not old_installer.exists() and not old_copy.exists() and fresh.exists()
+    assert update_client.cleanup_update_files() == 0  # nothing left to do; missing folders are fine

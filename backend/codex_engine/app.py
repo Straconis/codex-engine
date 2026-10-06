@@ -26,7 +26,7 @@ from .ollama_manager import OllamaManager
 from .platforming import app_data_dir, database_path, open_file_at_page
 from .settings import SettingsStore
 from .uploads import store_upload
-from .updater.update_client import check_for_update, download_installer, launch_updater
+from .updater.update_client import check_for_update, cleanup_update_files, download_installer, launch_updater
 
 # Every state-changing request must carry this header. A custom header forces a CORS
 # preflight, so random web pages open in the user's browser can't fire "simple"
@@ -57,6 +57,8 @@ async def lifespan(_app):
     # Start the managed Ollama in the background so the first "AI format" is quick.
     # Never blocks startup: AI is optional.
     threading.Thread(target=ollama.ensure_running, daemon=True).start()
+    # The downloaded installer and updater copy from a previous update aren't needed anymore.
+    threading.Thread(target=cleanup_update_files, daemon=True).start()
     yield
     ollama.stop()
 
