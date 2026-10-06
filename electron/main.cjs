@@ -431,13 +431,18 @@ ipcMain.on("codex-engine:renderer-log-file", (_event, line) => {
   }
 });
 
+// "Codex Engine 0.3.6": the version comes from package.json (app.getVersion()).
+function windowTitle() {
+  return `Codex Engine ${app.getVersion()}`;
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 820,
     minWidth: 900,
     minHeight: 640,
-    title: "Codex Engine",
+    title: windowTitle(),
     backgroundColor: "#0b0f14",
     icon: path.join(ROOT, "assets", process.platform === "win32" ? "icons-v2/codex-engine-v2.ico" : "icons-v2/codex-engine-v2-256.png"),
     webPreferences: {
@@ -446,6 +451,9 @@ function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
+
+  // Keep the version in the title bar: the page's <title> would otherwise replace it.
+  mainWindow.on("page-title-updated", (event) => event.preventDefault());
 
   mainWindow.on("closed", () => {
     mainWindow = null;

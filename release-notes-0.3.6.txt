@@ -1,0 +1,3 @@
+The title bar shows the version number (for example "Codex Engine 0.3.6").
+First release published for the built-in updater since 0.2.1: Settings > General > "Check for updates" now finds new versions and installs them for you.
+Includes everything since 0.2.1: the page reader with search highlighting, automatic page cleanup, optional local AI formatting through Ollama (with retries, a progress window, a "Changes" view and manual page edits), the Settings panel, opening PDFs at the right page, and an installer that closes the app and shows the uninstaller in the Start menu.
