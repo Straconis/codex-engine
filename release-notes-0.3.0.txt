@@ -1,0 +1,6 @@
+New page reader: click a search result to read the whole page, with Prev/Next, and switch between AI-formatted, cleaned and raw text.
+Pages are cleaned up automatically at import: running headers, footers and page numbers are removed, headings are detected, paragraphs and lists are rebuilt, words split across lines are re-joined, and stat blocks get bold labels and an ability-score table. Search uses the cleaned text too.
+Books imported with earlier versions are upgraded automatically the first time you open one in the reader.
+Optional local AI formatting (through Ollama) restores structure such as headings, lists, quotes and tables. It never rewrites the book: any output that changes, drops or adds words is rejected and the cleaned text is kept. Text never leaves your computer.
+New Settings panel: Codex Engine can run Ollama for you and store AI models in any folder, including a second or external drive, and can download models with a progress bar. Each computer keeps its own settings.
+Everything works without Ollama; the reader simply shows the cleaned text.

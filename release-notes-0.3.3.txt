@@ -1,0 +1,7 @@
+AI formatting now retries automatically: each part of a page gets 3 more attempts, and every retry tells the model exactly what it got wrong (for example a changed word or capitalisation).
+If a part still can't be formatted without changing the text, the reader asks what to do: keep trying, keep the cleaned text for those parts, or edit the page yourself. Nothing is changed until you choose.
+New progress window while AI formatting runs: a real progress bar (it follows the model's reply as it is written), the current part and attempt, elapsed time, and a plain-language log of each step. It floats in the corner so you can keep reading.
+Cancel button: stops formatting right away, including the model itself. Parts already accepted are kept for next time.
+Edit page: correct any page by hand (Markdown supported). Your edit is shown instead of the automatic versions, can be reverted anytime, and survives later cleanup updates. The PDF is never changed.
+Typing in the editor no longer turns pages, and unsaved edits aren't discarded without asking.
+Restarting Ollama after changing its folder or port now waits for the old one to let go of the port.

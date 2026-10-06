@@ -1,8 +1,11 @@
 #define MyAppName "Codex Engine"
-#define MyAppVersion "0.2.1"
+; Version is passed in by scripts/build-installer-inno.ps1 from package.json.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.3.4"
+#endif
 #define MyAppPublisher "Codex Engine"
 #define MyAppExeName "Codex Engine.exe"
-#define SourceDir "..\dist\win-unpacked"
+#define SourceDir "..\release\electron\win-unpacked"
 
 [Setup]
 AppId={{8BA77CE7-5079-4F72-90ED-7CB3BDBA9C0F}
@@ -32,7 +35,8 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Uninstall\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+; Directly in the group: Windows 10/11 Start menus don't show nested subfolders.
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]

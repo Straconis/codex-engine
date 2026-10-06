@@ -9,7 +9,8 @@ from pathlib import Path
 import pymupdf
 
 from . import db
-from .models import ChunkRow, DuplicateDetectedPayload, IngestProgress
+from .formatting import FORMATTER_VERSION, PageLayout, first_heading, format_document, layout_from_pymupdf, markdown_to_plain
+from .models import ChunkRow, DuplicateDetectedPayload, IngestProgress, PageContent
 from .platforming import normalize_pdf_path
 
 
@@ -27,16 +28,45 @@ def sha256_hex(path: Path, cancel: threading.Event) -> str:
     return digest.hexdigest()
 
 
-def extract_pages(path: Path, cancel: threading.Event) -> list[str]:
-    pages: list[str] = []
+def extract_layouts(path: Path, cancel: threading.Event | None = None) -> list[PageLayout]:
+    layouts: list[PageLayout] = []
     with pymupdf.open(path) as doc:
         if doc.needs_pass:
             raise RuntimeError("PDF appears to be encrypted/password-protected. Cannot ingest encrypted PDFs.")
         for page in doc:
-            if cancel.is_set():
+            if cancel is not None and cancel.is_set():
                 raise RuntimeError("Cancelled")
-            pages.append(page.get_text("text"))
-    return pages
+            layouts.append(layout_from_pymupdf(page))
+    return layouts
+
+
+def build_page_texts(path: Path, cancel: threading.Event | None = None) -> list[str]:
+    """Rule-cleaned Markdown for every page of a PDF."""
+    return [p.clean_md for p in build_source_content(extract_layouts(path, cancel))[0]]
+
+
+def build_source_content(
+    layouts: list[PageLayout], cancel: threading.Event | None = None, on_page=None
+) -> tuple[list[PageContent], list[ChunkRow]]:
+    """Deterministic cleanup for a whole document, plus search chunks built from it."""
+    cleaned = format_document(layouts)
+    pages: list[PageContent] = []
+    chunks: list[ChunkRow] = []
+    for index, (layout, text) in enumerate(zip(layouts, cleaned), start=1):
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("Cancelled")
+        pages.append(PageContent(raw_text=layout.raw_text, clean_md=text, clean_version=FORMATTER_VERSION))
+        plain = markdown_to_plain(text)
+        chunks.extend(chunk_text(index, first_heading(text) or pick_heading_from_text(plain), plain))
+        if on_page:
+            on_page(index, len(layouts))
+    return pages, chunks
+
+
+def rebuild_source(conn, source_id: int, path: Path) -> None:
+    """Re-run extraction + cleanup for an already-ingested book (formatter upgrades)."""
+    pages, chunks = build_source_content(extract_layouts(path))
+    db.rebuild_source_content(conn, source_id, pages, chunks)
 
 
 def pick_heading_from_text(page_text: str) -> str | None:
@@ -78,8 +108,11 @@ class IngestJob:
 
 
 class IngestManager:
-    def __init__(self, conn_factory, emit_progress, emit_duplicate):
+    def __init__(self, conn_factory, emit_progress, emit_duplicate, managed_dir: Path | None = None):
         self._conn_factory = conn_factory
+        # Files under managed_dir (the uploads folder) are owned by the app and may be
+        # cleaned up when an ingest is discarded and nothing references them.
+        self._managed_dir = managed_dir.resolve() if managed_dir else None
         self._emit_progress = emit_progress
         self._emit_duplicate = emit_duplicate
         self._next_id = 1
@@ -117,6 +150,18 @@ class IngestManager:
     def _progress(self, ingest_id: int, stage: str, message: str, current: int, total: int, done: bool = False, error: str | None = None) -> None:
         self._emit_progress(IngestProgress(id=ingest_id, stage=stage, message=message, current=current, total=total, done=done, error=error))
 
+    def _discard_managed_file(self, conn, path: Path) -> None:
+        if not self._managed_dir:
+            return
+        try:
+            if path.resolve().parent != self._managed_dir:
+                return
+            if db.source_path_in_use(conn, str(path)):
+                return
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _worker(self, job: IngestJob, path: Path) -> None:
         try:
             self._progress(job.id, "validate", "Validating PDF...", 0, 1)
@@ -127,6 +172,7 @@ class IngestManager:
             file_hash = sha256_hex(path, job.cancel)
             conn = self._conn_factory()
             try:
+                replace_source_id: int | None = None
                 existing = db.get_source_by_hash(conn, file_hash)
                 if existing:
                     payload = DuplicateDetectedPayload(
@@ -146,27 +192,37 @@ class IngestManager:
                     if job.cancel.is_set():
                         raise RuntimeError("Cancelled")
                     if job.duplicate_choice == "discard":
+                        self._discard_managed_file(conn, path)
                         self._progress(job.id, "done", "Duplicate detected. Kept original; discarded new ingest.", 1, 1, True)
                         return
                     if job.duplicate_choice == "replace":
-                        db.delete_source(conn, existing.id)
+                        # Deleted only once the new copy is fully extracted and written.
+                        replace_source_id = existing.id
 
                 self._progress(job.id, "extract", "Extracting text with PyMuPDF...", 0, 1)
-                pages = extract_pages(path, job.cancel)
-                page_count = len(pages)
-                source_id = db.create_source(conn, file_title_from_path(path), str(path), file_hash, page_count, True)
+                layouts = extract_layouts(path, job.cancel)
+                page_count = len(layouts)
+                total = max(1, page_count)
+                self._progress(job.id, "chunk", "Cleaning up layout and chunking pages...", 0, total)
+                pages, all_chunks = build_source_content(
+                    layouts,
+                    job.cancel,
+                    lambda index, n: self._progress(job.id, "chunk", f"Chunking page {index}/{n}...", index, n),
+                )
 
-                all_chunks: list[ChunkRow] = []
-                self._progress(job.id, "chunk", "Chunking pages...", 0, max(1, page_count))
-                for index, text in enumerate(pages, start=1):
-                    if job.cancel.is_set():
-                        db.delete_source(conn, source_id)
-                        raise RuntimeError("Cancelled")
-                    all_chunks.extend(chunk_text(index, pick_heading_from_text(text), text))
-                    self._progress(job.id, "chunk", f"Chunking page {index}/{max(1, page_count)}...", index, max(1, page_count))
-
+                if job.cancel.is_set():
+                    raise RuntimeError("Cancelled")
                 self._progress(job.id, "db", f"Writing {len(all_chunks)} chunks to database...", 0, 1)
-                db.insert_chunks(conn, source_id, all_chunks)
+                db.create_source_with_chunks(
+                    conn,
+                    file_title_from_path(path),
+                    str(path),
+                    file_hash,
+                    page_count,
+                    all_chunks,
+                    replace_source_id=replace_source_id,
+                    page_rows=pages,
+                )
                 self._progress(job.id, "done", f"Ingest complete. Pages: {page_count} - Chunks: {len(all_chunks)}", 1, 1, True)
             finally:
                 conn.close()
@@ -175,4 +231,3 @@ class IngestManager:
         finally:
             time.sleep(0.1)
             self._jobs.pop(job.id, None)
-

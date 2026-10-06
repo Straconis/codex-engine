@@ -27,6 +27,7 @@ Invoke-Checked $python @(
   "--noconfirm",
   "--name", "codex-engine-updater",
   "--onefile",
+  "--noconsole",
   "--icon", $icon,
   "codex_engine\updater\updater.py"
 ) $backend

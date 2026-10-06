@@ -119,6 +119,7 @@ def check_for_update(current_version: str = APP_VERSION) -> dict:
         "platform": platform_name,
         "installer_name": asset.get("name"),
         "installer_url": asset.get("browser_download_url"),
+        "installer_size": asset.get("size"),
     }
 
 
@@ -130,16 +131,30 @@ def download_installer(update: dict) -> str:
 
     download_dir = Path(tempfile.gettempdir()) / "CodexEngineUpdate"
     download_dir.mkdir(parents=True, exist_ok=True)
-    installer_path = download_dir / installer_name
+    installer_path = download_dir / Path(installer_name).name
+    partial_path = installer_path.with_name(installer_path.name + ".part")
+    expected_size = update.get("installer_size")
 
     request = urllib.request.Request(installer_url, headers={"User-Agent": "Codex-Engine-Updater"})
-    with urllib.request.urlopen(request, timeout=120) as response:
-        with installer_path.open("wb") as output_file:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output_file.write(chunk)
+    written = 0
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with partial_path.open("wb") as output_file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output_file.write(chunk)
+                    written += len(chunk)
+        # A dropped connection can end the read loop "successfully" with a truncated
+        # file; never hand a truncated installer to the updater.
+        if isinstance(expected_size, int) and expected_size > 0 and written != expected_size:
+            raise RuntimeError(f"Installer download was incomplete ({written} of {expected_size} bytes).")
+        if written == 0:
+            raise RuntimeError("Installer download was empty.")
+        os.replace(partial_path, installer_path)
+    finally:
+        partial_path.unlink(missing_ok=True)
 
     return str(installer_path)
 

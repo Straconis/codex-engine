@@ -1,0 +1,8 @@
+Search no longer fails on terms like half-orc, kenku's, d&d or +1 sword, and result snippets now show the matching text.
+Uploading two different PDFs with the same file name no longer overwrites the first one.
+"Replace existing" on a duplicate keeps the original until the new copy is fully indexed.
+Fixed live progress events getting lost after toggling the Console/File logs options.
+Codex Engine now picks another port if 8787 is already used by a different program.
+"File logs" now actually writes logs/ui.log; backend logs rotate at 5 MB.
+The updater no longer shows a console window, and verifies the installer download is complete.
+The local API now rejects cross-site requests from web pages.

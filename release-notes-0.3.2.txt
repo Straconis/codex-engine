@@ -1,0 +1,9 @@
+Search terms are now highlighted in results and in the page reader, which jumps to the first match and shows how many matches the page has.
+AI formatting is stricter: it can no longer drop a line (it once removed a stat block's Senses line) or change capitalisation; such output is rejected and the cleaned text is kept.
+AI formatting is much faster on pages where a small model starts repeating itself: replies are capped, so a page takes seconds instead of minutes. The reader shows progress, and you can keep reading other pages while it works.
+Better cleanup for GM Binder-style PDFs: no more text fragments from the page edge, stat-block lines (Armor Class, Hit Points, ...) are bold labels on their own lines instead of headings, and ability scores become a table.
+Fewer false bold phrases in the middle of sentences; "creatures' spaces" and "5-6" instead of broken characters.
+The layout keeps the sources and results side by side at the smallest window size, with a more compact header.
+Cleaner top bar: Check for Updates, the light/dark theme and the diagnostics options moved to Settings > General. The theme is now remembered.
+Result and source cards no longer show file paths and hashes (hover to see them).
+Books already in your library are re-cleaned automatically the next time you open them.

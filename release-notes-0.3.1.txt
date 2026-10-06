@@ -1,0 +1,5 @@
+Settings: with unsaved changes, the Download button becomes "Save & download" and saves first, so the model always goes into the folder shown.
+Settings: the AI status now updates while Ollama is starting, instead of staying on "starting" until the panel is reopened.
+Settings: when Download is unavailable, a note under the button explains why.
+Saving settings now finishes switching Ollama over before anything else (like a download) can use it.
+Installer: "Uninstall Codex Engine" now appears in the Start menu next to the app (Windows hides nested Start menu folders).

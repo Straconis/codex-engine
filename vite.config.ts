@@ -14,5 +14,8 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 1420,
     strictPort: true,
+    // Build outputs and the Python backend aren't frontend sources. Watching them made the
+    // dev server crash (EBUSY) when an installer was being written during a build.
+    watch: { ignored: ["**/release/**", "**/dist/**", "**/backend/**", "**/resources/**"] },
   },
 });

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
-from .models import ChunkRow, SearchRow, SourceRow
+from .models import ChunkRow, PageContent, PageRow, SearchRow, SourceRow
 
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -44,9 +45,52 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id);
         CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page_num);
+
+        -- Reader text per page. raw_text is the untouched extraction, clean_md the
+        -- deterministic cleanup (clean_version = formatting.FORMATTER_VERSION that made it),
+        -- ai_md the optional AI-formatted version and ai_source_hash the clean_md it came from.
+        CREATE TABLE IF NOT EXISTS pages (
+          source_id INTEGER NOT NULL,
+          page_num INTEGER NOT NULL,
+          clean_md TEXT NOT NULL,
+          ai_md TEXT,
+          ai_model TEXT,
+          PRIMARY KEY (source_id, page_num),
+          FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+        );
+
+        -- AI output per formatted section, keyed by hash(prompt version, model, input text).
+        -- Survives re-ingest/replace, so identical text is never sent to the model twice.
+        CREATE TABLE IF NOT EXISTS ai_cache (
+          key TEXT PRIMARY KEY,
+          model TEXT NOT NULL,
+          output TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         """
     )
+    _migrate_pages(conn)
     ensure_fts(conn)
+
+
+# Columns added to `pages` after it first shipped; added in place on older databases.
+_PAGE_COLUMNS = {
+    "raw_text": "TEXT",
+    "clean_version": "INTEGER NOT NULL DEFAULT 0",
+    "ai_source_hash": "TEXT",
+    "ai_error": "TEXT",
+    "ai_updated_at": "TEXT",
+    "edited_md": "TEXT",  # the user's own correction of the page; shown before anything else
+    "edited_at": "TEXT",
+}
+
+
+def _migrate_pages(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(pages)")}
+    for name, decl in _PAGE_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {name} {decl}")
+    conn.commit()
 
 
 def ensure_fts(conn: sqlite3.Connection) -> None:
@@ -136,11 +180,194 @@ def insert_chunks(conn: sqlite3.Connection, source_id: int, chunks: list[ChunkRo
     return len(chunks)
 
 
+def create_source_with_chunks(
+    conn: sqlite3.Connection,
+    title: str,
+    path: str,
+    sha: str,
+    pages: int,
+    chunks: list[ChunkRow],
+    replace_source_id: int | None = None,
+    page_rows: list[PageContent] | None = None,
+) -> int:
+    """Insert a source and all of its chunks atomically.
+
+    If replace_source_id is given, that source is deleted in the same transaction,
+    so a failed or interrupted ingest never loses the original or leaves a
+    half-written source (which would otherwise poison duplicate detection).
+    """
+    with conn:  # BEGIN ... COMMIT, or ROLLBACK on any exception
+        if replace_source_id is not None:
+            conn.execute("DELETE FROM sources WHERE id=?", (replace_source_id,))
+        source_key = unique_source_key(conn, sha)
+        cur = conn.execute(
+            "INSERT INTO sources (title, path, sha256, pages, enabled, source_key) VALUES (?,?,?,?,?,?)",
+            (title, path, sha, pages, 1, source_key),
+        )
+        source_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO chunks (source_id, page_num, heading, body, loc) VALUES (?,?,?,?,?)",
+            [(source_id, c.page_num, c.heading, c.body, c.loc) for c in chunks],
+        )
+        if page_rows is not None:
+            _insert_pages(conn, source_id, page_rows)
+    return source_id
+
+
+def get_source(conn: sqlite3.Connection, source_id: int) -> SourceRow | None:
+    row = conn.execute(
+        "SELECT id, title, path, sha256, pages, enabled, source_key FROM sources WHERE id=?",
+        (source_id,),
+    ).fetchone()
+    return SourceRow(**dict(row)) if row else None
+
+
+_PAGE_SELECT = (
+    "SELECT source_id, page_num, raw_text, clean_md, clean_version, ai_md, ai_model, "
+    "ai_source_hash, ai_error, ai_updated_at, edited_md, edited_at FROM pages"
+)
+
+
+def _insert_pages(conn: sqlite3.Connection, source_id: int, page_rows: list[PageContent]) -> None:
+    conn.executemany(
+        "INSERT OR REPLACE INTO pages (source_id, page_num, raw_text, clean_md, clean_version) VALUES (?,?,?,?,?)",
+        [(source_id, i, p.raw_text, p.clean_md, p.clean_version) for i, p in enumerate(page_rows, start=1)],
+    )
+
+
+def rebuild_source_content(
+    conn: sqlite3.Connection, source_id: int, page_rows: list[PageContent], chunks: list[ChunkRow]
+) -> None:
+    """Replace a source's pages and search chunks in one transaction.
+
+    Used to upgrade books ingested by an older formatter. AI output already generated
+    is kept: ai_md is carried over and flagged stale by hash if the cleaned text changed,
+    and identical text is re-served from ai_cache.
+    """
+    with conn:
+        previous = {
+            row["page_num"]: row
+            for row in conn.execute(
+                "SELECT page_num, ai_md, ai_model, ai_source_hash, ai_error, ai_updated_at, edited_md, edited_at "
+                "FROM pages WHERE source_id=?",
+                (source_id,),
+            )
+        }
+        conn.execute("DELETE FROM pages WHERE source_id=?", (source_id,))
+        conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+        _insert_pages(conn, source_id, page_rows)
+        conn.executemany(
+            "UPDATE pages SET ai_md=?, ai_model=?, ai_source_hash=?, ai_error=?, ai_updated_at=?, edited_md=?, edited_at=? "
+            "WHERE source_id=? AND page_num=?",
+            [
+                (
+                    r["ai_md"], r["ai_model"], r["ai_source_hash"], r["ai_error"], r["ai_updated_at"],
+                    r["edited_md"], r["edited_at"], source_id, n,
+                )
+                for n, r in previous.items()
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO chunks (source_id, page_num, heading, body, loc) VALUES (?,?,?,?,?)",
+            [(source_id, c.page_num, c.heading, c.body, c.loc) for c in chunks],
+        )
+        conn.execute("UPDATE sources SET pages=? WHERE id=?", (len(page_rows), source_id))
+
+
+def oldest_clean_version(conn: sqlite3.Connection, source_id: int) -> int | None:
+    """Lowest formatter version among a source's pages; None if it has no pages yet."""
+    row = conn.execute("SELECT MIN(clean_version) AS v, COUNT(*) AS n FROM pages WHERE source_id=?", (source_id,)).fetchone()
+    return None if not row or not row["n"] else int(row["v"])
+
+
+def get_page(conn: sqlite3.Connection, source_id: int, page_num: int) -> PageRow | None:
+    row = conn.execute(f"{_PAGE_SELECT} WHERE source_id=? AND page_num=?", (source_id, page_num)).fetchone()
+    return PageRow(**dict(row)) if row else None
+
+
+def set_page_ai(conn: sqlite3.Connection, source_id: int, page_num: int, ai_md: str, ai_model: str, source_hash: str, note: str | None = None) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE pages SET ai_md=?, ai_model=?, ai_source_hash=?, ai_error=?, ai_updated_at=datetime('now') "
+            "WHERE source_id=? AND page_num=?",
+            (ai_md, ai_model, source_hash, note, source_id, page_num),
+        )
+
+
+def set_page_ai_error(conn: sqlite3.Connection, source_id: int, page_num: int, error: str) -> None:
+    """Record a failed AI attempt. Any earlier valid ai_md is kept."""
+    with conn:
+        conn.execute(
+            "UPDATE pages SET ai_error=?, ai_updated_at=datetime('now') WHERE source_id=? AND page_num=?",
+            (error, source_id, page_num),
+        )
+
+
+def set_page_edit(conn: sqlite3.Connection, source_id: int, page_num: int, markdown: str | None) -> None:
+    """Save (or with None, remove) the user's own version of a page. Other versions are untouched."""
+    with conn:
+        conn.execute(
+            "UPDATE pages SET edited_md=?, edited_at=CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END "
+            "WHERE source_id=? AND page_num=?",
+            (markdown, markdown, source_id, page_num),
+        )
+
+
+def ai_cache_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT output FROM ai_cache WHERE key=?", (key,)).fetchone()
+    return row["output"] if row else None
+
+
+def ai_cache_put(conn: sqlite3.Connection, key: str, model: str, output: str) -> None:
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO ai_cache (key, model, output) VALUES (?,?,?)", (key, model, output))
+
+
+def source_path_in_use(conn: sqlite3.Connection, path: str) -> bool:
+    return conn.execute("SELECT 1 FROM sources WHERE path=? LIMIT 1", (path,)).fetchone() is not None
+
+
+# Invisible markers around matched terms in search snippets; the UI turns them into highlights.
+MATCH_START, MATCH_END = "\x02", "\x03"
+
+_QUERY_TOKEN_RE = re.compile(r'"[^"]*"|\S+')
+
+
+def build_match_query(raw: str) -> str:
+    """Turn free-form user input into a safe FTS5 MATCH expression.
+
+    Raw FTS5 syntax blows up on ordinary TTRPG searches like `half-orc`,
+    `kenku's`, `d&d`, `+1 sword` or `AC:`. Every term becomes a quoted phrase
+    (implicitly AND-ed). "quoted phrases" are kept together, and a trailing *
+    keeps prefix search working (e.g. `necro*`).
+    """
+    terms: list[str] = []
+    for token in _QUERY_TOKEN_RE.findall(raw or ""):
+        prefix = False
+        if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+            phrase = token[1:-1]
+        else:
+            phrase = token.replace('"', "")
+            if phrase.endswith("*"):
+                phrase = phrase.rstrip("*")
+                prefix = True
+        if not any(ch.isalnum() for ch in phrase):
+            continue
+        term = '"' + phrase.replace('"', '""') + '"'
+        if prefix:
+            term += "*"
+        terms.append(term)
+    return " ".join(terms)
+
+
 def search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[SearchRow]:
+    match = build_match_query(query)
+    if not match:
+        return []
     rows = conn.execute(
         """
         SELECT s.id AS source_id, s.title AS source_title, s.path AS source_path,
-               c.page_num, c.heading, substr(c.body, 1, 280) AS snippet, c.loc
+               c.page_num, c.heading, snippet(chunks_fts, 0, ?, ?, '…', 48) AS snippet, c.loc
         FROM chunks_fts
         JOIN chunks c ON c.id = chunks_fts.rowid
         JOIN sources s ON s.id = c.source_id
@@ -148,6 +375,6 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[Search
         ORDER BY bm25(chunks_fts) ASC
         LIMIT ?
         """,
-        (query, limit),
+        (MATCH_START, MATCH_END, match, limit),
     ).fetchall()
     return [SearchRow(**dict(row)) for row in rows]

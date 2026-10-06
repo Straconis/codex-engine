@@ -34,6 +34,41 @@ def normalize_pdf_path(path: str) -> Path:
     return candidate.resolve()
 
 
+def default_pdf_viewer_windows() -> str | None:
+    """Full path of the program Windows opens .pdf files with (None if unknown)."""
+    import ctypes
+    from ctypes import wintypes
+
+    shlwapi = ctypes.WinDLL("shlwapi")
+    fn = shlwapi.AssocQueryStringW
+    fn.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    size = wintypes.DWORD(1024)
+    buf = ctypes.create_unicode_buffer(size.value)
+    # ASSOCF_NOTRUNCATE = 0x20, ASSOCSTR_EXECUTABLE = 2
+    if fn(0x20, 2, ".pdf", "open", buf, ctypes.byref(size)) != 0 or not buf.value:
+        return None
+    return buf.value
+
+
+def viewer_command(viewer: str, target: Path, page: int) -> list[str] | None:
+    """Command that opens `target` at `page` in `viewer`, or None if we don't know how.
+
+    Windows drops "#page=N" when it hands a file to the default app, so each viewer gets
+    the page in its own command-line syntax.
+    """
+    name = Path(viewer).name.lower()
+    path = str(target)
+    if name in ("acrobat.exe", "acrord32.exe", "acrord64.exe", "pdfxedit.exe", "pdfxcview.exe"):
+        return [viewer, "/A", f"page={page}", path]
+    if name.startswith("foxit"):
+        return [viewer, path, "/A", f"page={page}"]
+    if name.startswith("sumatrapdf"):
+        return [viewer, "-page", str(page), path]
+    if name in ("msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe"):
+        return [viewer, target.as_uri() + f"#page={page}"]
+    return None
+
+
 def open_file_at_page(path: str, page: int) -> None:
     target = normalize_pdf_path(path)
     page = max(1, int(page or 1))
@@ -41,7 +76,12 @@ def open_file_at_page(path: str, page: int) -> None:
     system = platform.system().lower()
 
     if system == "windows":
-        os.startfile(uri)  # type: ignore[attr-defined]
+        viewer = default_pdf_viewer_windows()
+        command = viewer_command(viewer, target, page) if viewer else None
+        if command:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.startfile(str(target))  # type: ignore[attr-defined]  # unknown viewer: at least open the file
         return
     if system == "darwin":
         subprocess.Popen(["open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -1,0 +1,1 @@
+Moves the uninstall shortcut into the Start Menu uninstall folder.

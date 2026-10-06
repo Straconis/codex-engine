@@ -1,0 +1,7 @@
+Open PDF now opens on the right page. Codex Engine finds the program that opens PDFs on your computer (Adobe Acrobat/Reader, SumatraPDF, Foxit, PDF-XChange, or a web browser) and tells it which page to show.
+New "Changes" view in the reader: see exactly what the AI changed compared with the cleaned text. Removed text is struck through, added text highlighted, invisible characters labelled.
+When AI formatting finishes, it says what it changed, or that the page was already well formatted and nothing needed changing.
+Stricter AI check: punctuation must stay exactly as written too. A dropped, added or changed period, comma or quote mark is now caught and sent back to the model with the correction.
+Importing a PDF shows a step-by-step log and the elapsed time.
+Search says when it is only showing the first 50 results.
+Settings has a single Close button; "Discard changes" appears only when there are unsaved changes.

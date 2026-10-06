@@ -20,6 +20,14 @@ $backend = Join-Path $root "backend"
 $icon = Join-Path $root "assets\icons-v2\codex-engine-v2.ico"
 $python = if ($env:CODEX_ENGINE_PYTHON) { $env:CODEX_ENGINE_PYTHON } else { "python" }
 
+# Fail fast if the backend version drifted from package.json (it feeds the update check).
+$version = (Get-Content (Join-Path $root "package.json") -Raw | ConvertFrom-Json).version
+$configText = Get-Content (Join-Path $backend "codex_engine\config.py") -Raw
+if ($configText -notmatch 'APP_VERSION\s*=\s*"([^"]+)"') { throw "APP_VERSION not found in backend\codex_engine\config.py" }
+if ($Matches[1] -ne $version) {
+  throw "Version mismatch: package.json is $version but backend config.py APP_VERSION is $($Matches[1])"
+}
+
 Invoke-Checked $python @("-m", "pip", "install", "-r", "requirements-build.txt") $backend
 Invoke-Checked $python @(
   "-m", "PyInstaller",
