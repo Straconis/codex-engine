@@ -1,0 +1,5 @@
+Safer desktop app. Dropping a file on the window no longer replaces Codex Engine with that file, and links or pop-ups can't take the window anywhere else. The window may only run the app's own code, and the log console can no longer reach the app's desktop features. Uninstalling from Settings now asks in a Windows dialog.
+Closing is cleaner. If Codex Engine crashes or is ended from Task Manager, its background service and Ollama now stop too, instead of lingering and clashing with the next launch. Quitting can no longer hang for minutes on a stuck background service, and Ollama gets enough time to shut down properly.
+Updated to Electron 44. Electron 37, which the app used before, no longer gets security fixes.
+Installer: it refuses to install on 32-bit Windows, removes leftover files from the previous version when upgrading, only closes your own copy of Codex Engine (not other people's on the same PC), and the "Codex Engine Data Folder" shortcut opens the folder of whoever clicks it.
+The background service only ever listens on this computer, and a few of its checks are stricter.

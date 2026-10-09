@@ -37,7 +37,7 @@ AI settings are stored per computer, in `settings.json` in the app data folder. 
 2. Choose a **model storage folder** with room for models (about 1–5 GB each), e.g. `D:\ollama\models`.
 3. Click **Download** to fetch a model (default `qwen2.5:1.5b`). Progress shows in the panel.
 
-By default **Codex Engine runs Ollama itself** (`ollama serve` with `OLLAMA_MODELS` set to your folder). It runs on its own port (11435), so it never conflicts with an Ollama you run separately, and it stops when the app closes. On Windows, Ollama and its model runners sit in a Job Object, so they also stop if the app crashes. If the model folder's drive isn't connected, or Ollama isn't installed yet, the app says so and keeps working without AI; it tries again (at most every 10 seconds) the next time AI is needed, so plugging the drive in or installing Ollama needs no restart. Saving Settings restarts Ollama only when a setting it runs with changed (not for a different model). Elsewhere than Windows, a crashed backend's Ollama is cleaned up the next time the app starts.
+By default **Codex Engine runs Ollama itself** (`ollama serve` with `OLLAMA_MODELS` set to your folder). It runs on its own port (11435), so it never conflicts with an Ollama you run separately, and it stops when the app closes. On Windows, Ollama and its model runners sit in a Job Object, so they also stop if the backend crashes. If the app window crashes or is ended from Task Manager, the backend notices and stops too, taking Ollama with it, so the next launch never finds an old backend still holding the library. If the model folder's drive isn't connected, or Ollama isn't installed yet, the app says so and keeps working without AI; it tries again (at most every 10 seconds) the next time AI is needed, so plugging the drive in or installing Ollama needs no restart. Saving Settings restarts Ollama only when a setting it runs with changed (not for a different model). Elsewhere than Windows, a crashed backend's Ollama is cleaned up the next time the app starts.
 
 Alternatively, choose **I run Ollama myself** and enter its address (default `http://127.0.0.1:11434`, or another machine on your network).
 
@@ -86,7 +86,7 @@ npm run dev
 npm run desktop
 ```
 
-`npm run desktop` opens a Codex Engine desktop window and starts the Python backend automatically from `backend/.venv`.
+`npm run desktop` opens a Codex Engine desktop window and starts the Python backend (`backend/server_entry.py`) automatically with `backend/.venv` (or the Python in `CODEX_ENGINE_PYTHON`). Set `CODEX_ENGINE_USE_BUILD=1` to show the built UI from `dist/` instead of the dev server, the way the installed app does.
 
 You can still open `http://127.0.0.1:1420` directly for browser debugging.
 
@@ -115,34 +115,31 @@ cd C:\Projects\codex-engine
 npm run build:backend:win
 ```
 
-Build the full Windows installer with Electron Builder/NSIS:
-
-```powershell
-npm run dist:win
-```
-
-Build the full Windows installer with Inno Setup 6:
+Build the full Windows installer (Inno Setup 6). This is the only installer: the in-app updater and **Settings > Uninstall** rely on it.
 
 ```powershell
 npm run dist:win:inno
 ```
 
-If you already have `release\win-unpacked`, build only the Inno installer:
+The installer is written to `release\installer\CodexEngineSetup-<version>.exe`. If you already have `release\electron\win-unpacked`, build only the installer:
 
 ```powershell
 npm run installer:inno
 ```
 
-The app version lives in `package.json`. `build-installer-inno.ps1` passes it to Inno Setup, and `build-backend-win.ps1` fails if `backend/codex_engine/config.py` `APP_VERSION` doesn't match, so bump both together (along with `package-lock.json` and `installer/codex-engine.iss`), and add a `release-notes-<version>.txt`.
+The app version lives in `package.json`. `build-installer-inno.ps1` passes it to Inno Setup, and `build-backend-win.ps1` fails if `backend/codex_engine/config.py` `APP_VERSION` doesn't match, so bump both together (along with `package-lock.json` and `installer/codex-engine.iss`), and add a `release-notes-<version>.txt`. CI checks all of this on every pull request (`scripts/check-version.mjs`; run it yourself with `node scripts/check-version.mjs`).
 
 The packaging flow is:
 
 1. Build the React frontend into `dist/`.
 2. Build `resources/backend/codex-engine-backend.exe` with PyInstaller.
-3. Package Electron with the frontend, assets, and backend sidecar.
-4. The installed app launches the backend automatically; users do not manage terminals or a browser.
+3. Build the updater with PyInstaller, then package Electron with the frontend, assets, backend and updater into `release\electron\win-unpacked`.
+4. Build the Inno Setup installer from that folder.
+5. The installed app launches the backend automatically; users do not manage terminals or a browser.
 
 ## Architecture note
 
 There are still two processes internally: the Electron UI process and the Python backend process. That is intentional. It isolates long-running PDF ingest/search work from the UI, keeps the backend reusable, and makes Python packaging practical. To the user, it should behave as one desktop program.
+
+The backend only listens on this computer (it refuses any non-loopback `--host`), and the window only ever shows the app itself: dropped files, links and pop-ups can't navigate it elsewhere, the page may only run its own scripts (a Content-Security-Policy), and the desktop features (file pickers, uninstall) answer only the app's own page. Uninstalling from Settings asks for confirmation in a native dialog.
 

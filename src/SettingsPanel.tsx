@@ -352,9 +352,13 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                   <button
                     className="btn small danger"
                     onClick={async () => {
-                      if (!confirm("Uninstall Codex Engine? The app will close and the uninstaller will start.")) return;
-                      const problem = await window.codexEngine!.uninstall!();
-                      if (problem) setError(problem);
+                      // The desktop app asks for confirmation itself.
+                      try {
+                        const problem = await window.codexEngine!.uninstall!();
+                        if (problem) setError(problem);
+                      } catch (e) {
+                        setError(`Couldn't start the uninstaller: ${String(e)}`);
+                      }
                     }}
                   >
                     Uninstall Codex Engine…

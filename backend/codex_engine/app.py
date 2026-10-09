@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import sqlite3
@@ -67,13 +68,14 @@ app = FastAPI(title="Codex Engine API", lifespan=lifespan)
 # Added first = innermost. CORS is added last so it wraps everything, including 403s.
 app.add_middleware(RequireClientHeaderMiddleware)
 # Blocks DNS-rebinding attacks (evil.example resolving to 127.0.0.1).
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+# Only the Vite dev server needs this: the desktop app loads its UI from file://, and
+# Electron doesn't apply CORS to file:// pages.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", "X-Codex-Engine-Client"],
 )
 
 
@@ -108,7 +110,13 @@ def _emit_duplicate(payload):
 
 def _authorized_shutdown(token: str | None) -> bool:
     expected = os.environ.get("CODEX_ENGINE_SHUTDOWN_TOKEN")
-    return bool(expected) and token == expected
+    return bool(expected) and token is not None and hmac.compare_digest(token.encode(), expected.encode())
+
+
+def stop_and_exit() -> None:
+    """Stop the managed Ollama, then end the process at once."""
+    ollama.stop()  # os._exit skips cleanup, and a managed Ollama must not outlive the app
+    os._exit(0)
 
 
 def _uploads_dir() -> Path:
@@ -171,11 +179,7 @@ def shutdown(x_codex_engine_shutdown_token: str | None = Header(default=None)):
     if not _authorized_shutdown(x_codex_engine_shutdown_token):
         raise HTTPException(status_code=403, detail="Shutdown is not authorized.")
 
-    def stop_process():
-        ollama.stop()  # os._exit skips cleanup, and a managed Ollama must not outlive the app
-        os._exit(0)
-
-    threading.Timer(0.25, stop_process).start()
+    threading.Timer(0.25, stop_and_exit).start()
     return {"ok": True}
 
 

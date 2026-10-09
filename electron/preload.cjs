@@ -29,15 +29,6 @@ contextBridge.exposeInMainWorld("codexEngine", {
   },
 });
 
-contextBridge.exposeInMainWorld("codexConsole", {
-  onLine(callback) {
-    const listener = (_event, line) => callback(String(line));
-    ipcRenderer.on("codex-engine:console-line", listener);
-    return () => ipcRenderer.removeListener("codex-engine:console-line", listener);
-  },
-});
-
-
 ipcRenderer.on("codex-engine:console-closed", () => {
   window.dispatchEvent(new Event("codex-engine:console-closed"));
 });

@@ -6,6 +6,13 @@ on:
   pull_request:
 
 jobs:
+  version:
+    name: Version and release notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node scripts/check-version.mjs
+
   backend:
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

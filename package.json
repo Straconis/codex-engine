@@ -1,7 +1,7 @@
 {
   "name": "codex-engine",
   "private": true,
-  "version": "0.3.12",
+  "version": "0.3.13",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,8 +10,6 @@
     "preview": "vite preview",
     "backend": "python -m uvicorn codex_engine.app:app --app-dir backend --host 127.0.0.1 --port 8787 --reload",
     "build:backend:win": "powershell -ExecutionPolicy Bypass -File scripts/build-backend-win.ps1",
-    "package:win": "electron-builder --win",
-    "dist:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",
     "package:dir": "electron-builder --win dir",
     "installer:inno": "powershell -ExecutionPolicy Bypass -File scripts/build-installer-inno.ps1",
     "dist:win:inno": "powershell -ExecutionPolicy Bypass -File scripts/dist-win-inno.ps1",
@@ -25,10 +23,10 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.0.12",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4",
-    "electron": "^37.3.1",
-    "electron-builder": "^26.0.12"
+    "vite": "^7.0.4"
   },
   "main": "electron/main.cjs",
   "build": {
@@ -56,12 +54,7 @@
     ],
     "win": {
       "icon": "assets/icons-v2/codex-engine-v2.ico",
-      "target": "nsis"
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "target": "dir"
     },
     "mac": {
       "icon": "assets/icons-v2/codex-engine-v2-512.png"
@@ -72,7 +65,7 @@
     }
   },
   "allowScripts": {
-    "electron@37.10.3": true,
+    "electron@44.4.5": true,
     "esbuild@0.27.3": true,
     "electron-winstaller@5.4.0": true
   }

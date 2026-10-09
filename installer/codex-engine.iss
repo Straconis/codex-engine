@@ -1,7 +1,7 @@
 #define MyAppName "Codex Engine"
 ; Version is passed in by scripts/build-installer-inno.ps1 from package.json.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.12"
+  #define MyAppVersion "0.3.13"
 #endif
 #define MyAppPublisher "Codex Engine"
 #define MyAppExeName "Codex Engine.exe"
@@ -21,6 +21,8 @@ SetupIconFile=..\assets\icons-v2\codex-engine-v2.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
+; The app is built for 64-bit x86 only (ARM64 Windows runs it under emulation).
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
@@ -29,6 +31,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
+[InstallDelete]
+; Files from the previous version that the new one no longer has would otherwise stay.
+; The app's own files all live in these two folders; the library and settings don't.
+; Only when Codex Engine is already installed there, never in a folder that merely has them.
+Type: filesandordirs; Name: "{app}\resources"; Check: IsUpgrade
+Type: filesandordirs; Name: "{app}\locales"; Check: IsUpgrade
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -39,7 +48,9 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 ; A second app in the group keeps Windows from collapsing the folder down to just
 ; "Codex Engine" (which hides the uninstaller), and is handy on its own.
-Name: "{group}\{#MyAppName} Data Folder"; Filename: "{win}\explorer.exe"; Parameters: """{localappdata}\{#MyAppName}"""; Comment: "Your Codex Engine library, settings and logs"
+; The app opens the folder of whoever clicks it (an admin installing for someone else
+; would otherwise point everyone at the admin's own folder).
+Name: "{group}\{#MyAppName} Data Folder"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--open-data-folder"; IconFilename: "{sys}\shell32.dll"; IconIndex: 3; Comment: "Your Codex Engine library, settings and logs"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
@@ -49,7 +60,18 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 // Windows' Restart Manager (Setup's "close applications automatically") can't close the
 // backend and its Ollama: they have no window. So close Codex Engine ourselves, the same
 // way clicking X does (the app then stops its backend and Ollama), and force-close
-// whatever is still running after a grace period.
+// whatever is still running after a grace period. Only the current user's copy: other
+// people signed in to this PC keep theirs (and Setup asks them to close it if needed).
+
+function IsUpgrade(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\{#MyAppExeName}'));
+end;
+
+function UserFilter(): String;
+begin
+  Result := '/FI "USERNAME eq ' + GetUserNameString() + '"';
+end;
 
 function IsRunning(const ExeName: String): Boolean;
 var
@@ -57,7 +79,7 @@ var
 begin
   // tasklist always exits 0; find /I exits 0 only when the name is in its output.
   Result := Exec(ExpandConstant('{cmd}'),
-    '/C tasklist /FI "IMAGENAME eq ' + ExeName + '" /NH | find /I "' + ExeName + '" >nul',
+    '/C tasklist /FI "IMAGENAME eq ' + ExeName + '" ' + UserFilter() + ' /NH | find /I "' + ExeName + '" >nul',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
@@ -73,7 +95,7 @@ begin
   if not AnyAppProcessRunning() then
     Exit;
   // Polite close: sends the window a close request, like clicking X.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), UserFilter() + ' /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Waited := 0;
   while AnyAppProcessRunning() and (Waited < 15000) do
   begin
@@ -83,8 +105,8 @@ begin
   // Anything left (a hung app, a backend without its window): force-close it and its children.
   if AnyAppProcessRunning() then
   begin
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM codex-engine-backend.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T ' + UserFilter() + ' /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T ' + UserFilter() + ' /IM codex-engine-backend.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(1000);
   end;
 end;

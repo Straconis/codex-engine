@@ -255,7 +255,7 @@ def api(tmp_path, monkeypatch):
 
     app_module._schema_ready = False
     app_module.ollama.apply(start=False)
-    return TestClient(app_module.app)
+    return TestClient(app_module.app, base_url="http://127.0.0.1")
 
 
 def test_settings_api_roundtrip_and_validation(api, tmp_path):
