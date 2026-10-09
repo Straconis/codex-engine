@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [python-refactor, Linux]
+    branches: [python-refactor]
   pull_request:
 
 jobs:
