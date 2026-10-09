@@ -117,7 +117,7 @@ def api(tmp_path, monkeypatch):
     app_module._schema_ready = False
     fake = FakeClient()
     monkeypatch.setattr(ai_format, "OllamaClient", lambda config: fake)
-    return TestClient(app_module.app), app_module, fake
+    return TestClient(app_module.app, base_url="http://127.0.0.1"), app_module, fake
 
 
 def add_source(app_module, path, *cleaned, version=FORMATTER_VERSION, with_pages=True):

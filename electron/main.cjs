@@ -1,9 +1,10 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const isPackaged = app.isPackaged;
 const ROOT = path.resolve(__dirname, "..");
@@ -12,10 +13,36 @@ let backendPort = PREFERRED_BACKEND_PORT;
 const backendOrigin = () => `http://127.0.0.1:${backendPort}`;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const DEV_FRONTEND_URL = process.env.CODEX_ENGINE_FRONTEND_URL || "http://127.0.0.1:1420";
-const FRONTEND_URL = isPackaged ? null : DEV_FRONTEND_URL;
+// CODEX_ENGINE_USE_BUILD=1 runs the built UI (dist/) in development, as the installed app does.
+const FRONTEND_URL = isPackaged || process.env.CODEX_ENGINE_USE_BUILD === "1" ? null : DEV_FRONTEND_URL;
 const SHUTDOWN_TOKEN = crypto.randomBytes(32).toString("hex");
+// How long to wait for the backend (and its Ollama) to stop by itself before force-closing it.
+const SHUTDOWN_REQUEST_TIMEOUT_MS = 3000;
+const SHUTDOWN_GRACE_MS = 12000;
+// The Start menu's "Codex Engine Data Folder" shortcut runs the app with this flag.
+const OPEN_DATA_FOLDER_FLAG = "--open-data-folder";
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
+// The backend keeps the library, settings and logs here (platformdirs' user_data_dir).
+function dataFolder() {
+  if (process.platform === "win32") {
+    return path.join(process.env.LOCALAPPDATA || path.join(app.getPath("home"), "AppData", "Local"), "Codex Engine");
+  }
+  if (process.platform === "darwin") return path.join(app.getPath("home"), "Library", "Application Support", "Codex Engine");
+  return path.join(process.env.XDG_DATA_HOME || path.join(app.getPath("home"), ".local", "share"), "Codex Engine");
+}
+
+function openDataFolder() {
+  fs.mkdirSync(dataFolder(), { recursive: true });
+  return shell.openPath(dataFolder());
+}
+
+const openingDataFolder = process.argv.includes(OPEN_DATA_FOLDER_FLAG);
+if (openingDataFolder) {
+  // Open the folder and leave: no window, no backend, and a running app isn't disturbed.
+  app.whenReady().then(() => openDataFolder()).finally(() => app.exit(0));
+}
+
+const gotSingleInstanceLock = openingDataFolder || app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
   process.exit(0);
@@ -106,11 +133,12 @@ function backendExecutable() {
   return path.join(ROOT, "backend", ".venv", "bin", "python");
 }
 
+// --exit-with-stdin: the backend stops when this app's end of its stdin closes, so it
+// can't outlive a crashed or killed app.
 function backendArgs() {
-  if (isPackaged || process.env.CODEX_ENGINE_BACKEND) {
-    return ["--host", "127.0.0.1", "--port", String(backendPort)];
-  }
-  return ["-m", "uvicorn", "codex_engine.app:app", "--host", "127.0.0.1", "--port", String(backendPort)];
+  const args = ["--host", "127.0.0.1", "--port", String(backendPort), "--exit-with-stdin"];
+  if (isPackaged || process.env.CODEX_ENGINE_BACKEND) return args;
+  return ["server_entry.py", ...args];
 }
 
 function backendCwd() {
@@ -174,7 +202,7 @@ async function startBackend() {
 
   const executable = backendExecutable();
   const logs = isPackaged ? backendLogFiles() : null;
-  const stdio = logs ? ["ignore", logs.out, logs.err] : "inherit";
+  const stdio = logs ? ["pipe", logs.out, logs.err] : ["pipe", "inherit", "inherit"];
   ownsBackend = true;
   backendProcess = spawn(executable, backendArgs(), {
     cwd: backendCwd(),
@@ -188,6 +216,9 @@ async function startBackend() {
     stdio,
     windowsHide: true,
   });
+
+  // Nothing is ever written to it; it only has to stay open while the app runs.
+  backendProcess.stdin.on("error", () => {});
 
   backendProcess.once("error", (error) => {
     dialog.showErrorBox("Codex Engine backend failed", String(error));
@@ -207,16 +238,27 @@ async function requestBackendShutdown() {
   if (!ownsBackend) return;
   shuttingDownBackend = true;
 
+  const child = backendProcess;
+  const exited = child
+    ? new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) resolve();
+        else child.once("exit", resolve);
+      })
+    : Promise.resolve();
+
   try {
     await fetch(`${backendOrigin()}/api/shutdown`, {
       method: "POST",
       headers: { "X-Codex-Engine-Shutdown-Token": SHUTDOWN_TOKEN },
+      signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
     });
   } catch {
-    // The backend may already be gone; fall through to process cleanup.
+    // Gone, or stuck: closing stdin asks it to stop too, then the grace period applies.
+    child?.stdin?.end();
   }
 
-  await sleep(750);
+  // Give it time to stop Ollama itself; that's what keeps the model runners from leaking.
+  await Promise.race([exited, sleep(SHUTDOWN_GRACE_MS)]);
 
   if (backendProcess) {
     const pid = backendProcess.pid;
@@ -242,6 +284,7 @@ function consoleHtml() {
 <html>
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
     <title>Codex Engine Console</title>
     <style>
       html, body { margin: 0; height: 100%; background: #070b10; color: #d7e3f1; }
@@ -341,7 +384,8 @@ function createConsoleWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      preload: path.join(__dirname, "preload.cjs"),
+      // Only the log feed: the console must not get the main window's bridge (uninstall etc.).
+      preload: path.join(__dirname, "console-preload.cjs"),
     },
   });
   consoleWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(consoleHtml())}`);
@@ -370,20 +414,49 @@ function setConsoleOpen(open) {
   }
 }
 
-ipcMain.on("codex-engine:set-console-open", (_event, open) => {
+// The app's own page: the dev server in development, dist/index.html when packaged.
+function isAppUrl(url) {
+  try {
+    const target = new URL(url);
+    if (FRONTEND_URL) return target.origin === new URL(FRONTEND_URL).origin;
+    const page = pathToFileURL(path.join(ROOT, "dist", "index.html"));
+    return target.protocol === "file:" && decodeURIComponent(target.pathname).toLowerCase() === decodeURIComponent(page.pathname).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+// Every request below must come from the main window showing the app's own page, never
+// from the console window or from anything that window may have been navigated to.
+function fromMainWindow(event) {
+  return Boolean(
+    mainWindow &&
+      !mainWindow.isDestroyed() &&
+      event.sender === mainWindow.webContents &&
+      event.senderFrame &&
+      event.senderFrame === mainWindow.webContents.mainFrame &&
+      isAppUrl(event.senderFrame.url),
+  );
+}
+
+ipcMain.on("codex-engine:set-console-open", (event, open) => {
+  if (!fromMainWindow(event)) return;
   setConsoleOpen(open);
 });
 
-ipcMain.on("codex-engine:renderer-log", (_event, line) => {
-  appendConsoleLine(line);
+ipcMain.on("codex-engine:renderer-log", (event, line) => {
+  if (!fromMainWindow(event)) return;
+  appendConsoleLine(String(line));
 });
 
 ipcMain.on("codex-engine:get-api-base", (event) => {
-  event.returnValue = backendOrigin();
+  // The preload asks while the page is still loading, so check the window, not the frame.
+  event.returnValue = mainWindow && event.sender === mainWindow.webContents ? backendOrigin() : null;
 });
 
 // Native pickers for Settings (model storage folder, Ollama program). Return a path or null.
-ipcMain.handle("codex-engine:pick-folder", async (_event, defaultPath) => {
+ipcMain.handle("codex-engine:pick-folder", async (event, defaultPath) => {
+  if (!fromMainWindow(event)) return null;
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Choose a folder for AI models",
     defaultPath: typeof defaultPath === "string" && defaultPath ? defaultPath : undefined,
@@ -392,7 +465,8 @@ ipcMain.handle("codex-engine:pick-folder", async (_event, defaultPath) => {
   return result.canceled ? null : result.filePaths[0] ?? null;
 });
 
-ipcMain.handle("codex-engine:pick-file", async (_event, defaultPath) => {
+ipcMain.handle("codex-engine:pick-file", async (event, defaultPath) => {
+  if (!fromMainWindow(event)) return null;
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Locate the Ollama program",
     defaultPath: typeof defaultPath === "string" && defaultPath ? defaultPath : undefined,
@@ -402,13 +476,27 @@ ipcMain.handle("codex-engine:pick-file", async (_event, defaultPath) => {
   return result.canceled ? null : result.filePaths[0] ?? null;
 });
 
-// Settings > "Uninstall Codex Engine...": start the installed uninstaller, then quit so it
-// can remove the app's files. Returns an error message, or null when it started.
-ipcMain.handle("codex-engine:uninstall", async () => {
+// Settings > "Uninstall Codex Engine...": confirm, start the installed uninstaller, then
+// quit so it can remove the app's files. Returns an error message, or null (started or
+// cancelled).
+ipcMain.handle("codex-engine:uninstall", async (event) => {
+  if (!fromMainWindow(event)) return "Not allowed.";
   const uninstaller = path.join(path.dirname(process.execPath), "unins000.exe");
   if (!isPackaged || !fs.existsSync(uninstaller)) {
     return "The uninstaller is only available in the installed app.";
   }
+  // Asked here, not only in the page, so nothing a page does can uninstall without the user.
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "warning",
+    title: "Uninstall Codex Engine",
+    message: "Uninstall Codex Engine?",
+    detail: "Codex Engine will close and its uninstaller will start.",
+    buttons: ["Uninstall", "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response !== 0) return null;
   try {
     spawn(uninstaller, [], { detached: true, stdio: "ignore" }).unref();
   } catch (error) {
@@ -419,7 +507,8 @@ ipcMain.handle("codex-engine:uninstall", async () => {
 });
 
 let uiLogPath = null;
-ipcMain.on("codex-engine:renderer-log-file", (_event, line) => {
+ipcMain.on("codex-engine:renderer-log-file", (event, line) => {
+  if (!fromMainWindow(event)) return;
   try {
     if (!uiLogPath) {
       uiLogPath = path.join(logsDir(), "ui.log");
@@ -467,6 +556,19 @@ function createWindow() {
   }
 }
 
+// Nothing may take a window away from the app's own page: not a file dropped on it, not a
+// link, not a script. New windows and <webview>s are refused outright.
+app.on("web-contents-created", (_event, contents) => {
+  contents.on("will-navigate", (navigation) => {
+    if (!isAppUrl(navigation.url)) navigation.preventDefault();
+  });
+  contents.on("will-redirect", (navigation) => {
+    if (!isAppUrl(navigation.url)) navigation.preventDefault();
+  });
+  contents.on("will-attach-webview", (attach) => attach.preventDefault());
+  contents.setWindowOpenHandler(() => ({ action: "deny" }));
+});
+
 app.on("second-instance", () => {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
@@ -474,6 +576,7 @@ app.on("second-instance", () => {
 });
 
 app.whenReady().then(async () => {
+  if (openingDataFolder) return;
   await startBackend();
   try {
     await waitForPort(backendPort);

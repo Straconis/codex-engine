@@ -28,7 +28,7 @@ def database_path() -> Path:
 
 def normalize_pdf_path(path: str) -> Path:
     candidate = Path(path).expanduser()
-    if not candidate.exists():
+    if not candidate.is_file():
         raise FileNotFoundError("File does not exist.")
     if candidate.suffix.lower() != ".pdf":
         raise ValueError("Not a PDF file.")
