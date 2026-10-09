@@ -98,6 +98,9 @@ def test_rejoining_split_words_is_allowed():
     check_faithful("a sense of imag ination and won der " + PROSE, "a sense of imagination and wonder " + PROSE)
 
 
+FOREST_INTRO = "The party travels through the dark forest toward the ruined keep on the hill. " * 3
+
+
 def test_only_a_bare_page_number_may_be_dropped():
     body = " ".join([PROSE] * 4)
     check_faithful("12\n" + body, body)  # stray page number on its own line
@@ -107,6 +110,15 @@ def test_only_a_bare_page_number_may_be_dropped():
     sentence = "Then the old wizard opened the door and walked slowly out into the pouring rain alone."
     with pytest.raises(AIFormatError, match="dropped"):
         check_faithful(body + " " + sentence + " " + body, body + " " + body)
+
+
+def test_number_lines_inside_a_section_are_not_page_numbers():
+    # A roll table: each entry's number sits on its own line, like a page number would.
+    table = "\n".join(f"{n}\nThe party meets a wandering merchant with strange wares." for n in range(1, 7))
+    src = FOREST_INTRO + "\n" + table + "\n" + FOREST_INTRO
+    with pytest.raises(AIFormatError, match="dropped text .*'3'"):
+        check_faithful(src, src.replace("\n3\n", "\n"))
+    check_faithful("212\n" + src + "\n213", src)  # real page numbers at the edges still go
 
 
 # Real output from qwen2.5:1.5b on Monsters of the Multiverse p. 276 that the old check accepted.

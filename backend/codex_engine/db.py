@@ -308,14 +308,52 @@ def set_page_ai_error(conn: sqlite3.Connection, source_id: int, page_num: int, e
         )
 
 
-def set_page_edit(conn: sqlite3.Connection, source_id: int, page_num: int, markdown: str | None) -> None:
-    """Save (or with None, remove) the user's own version of a page. Other versions are untouched."""
+def set_page_edit(
+    conn: sqlite3.Connection, source_id: int, page_num: int, markdown: str | None, chunks: list[ChunkRow]
+) -> None:
+    """Save (or with None, remove) the user's own version of a page. Other versions are untouched.
+
+    `chunks` replace the page's search chunks in the same transaction, so search finds
+    what the page now says (the edit, or the cleaned text again after a revert).
+    """
     with conn:
         conn.execute(
             "UPDATE pages SET edited_md=?, edited_at=CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END "
             "WHERE source_id=? AND page_num=?",
             (markdown, markdown, source_id, page_num),
         )
+        _replace_page_chunks(conn, source_id, page_num, chunks)
+
+
+def _replace_page_chunks(conn: sqlite3.Connection, source_id: int, page_num: int, chunks: list[ChunkRow]) -> None:
+    conn.execute("DELETE FROM chunks WHERE source_id=? AND page_num=?", (source_id, page_num))
+    conn.executemany(
+        "INSERT INTO chunks (source_id, page_num, heading, body, loc) VALUES (?,?,?,?,?)",
+        [(source_id, c.page_num, c.heading, c.body, c.loc) for c in chunks],
+    )
+
+
+def edited_pages(conn: sqlite3.Connection, source_id: int | None = None) -> list[PageRow]:
+    """Pages the user has corrected, for one source or all of them."""
+    where, params = ("AND source_id=?", (source_id,)) if source_id is not None else ("", ())
+    rows = conn.execute(f"{_PAGE_SELECT} WHERE edited_md IS NOT NULL {where} ORDER BY source_id, page_num", params).fetchall()
+    return [PageRow(**dict(r)) for r in rows]
+
+
+# PRAGMA user_version steps that need code outside this module (see app._conn).
+EDITS_INDEXED = 1
+
+
+def schema_step(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def reindex_edits(conn: sqlite3.Connection, chunks_by_page: dict[tuple[int, int], list[ChunkRow]]) -> None:
+    """One-time upgrade: index edits saved before 0.3.10, then record that it's done."""
+    with conn:
+        for (source_id, page_num), chunks in chunks_by_page.items():
+            _replace_page_chunks(conn, source_id, page_num, chunks)
+        conn.execute(f"PRAGMA user_version = {EDITS_INDEXED}")
 
 
 def ai_cache_get(conn: sqlite3.Connection, key: str) -> str | None:

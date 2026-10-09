@@ -229,12 +229,14 @@ def _words(text: str) -> list[str]:
 
 
 def _page_number_words(text: str) -> set[int]:
-    """Indices (into _words(text)) of words on a line that is nothing but a short number."""
+    """Indices (into _words(text)) of a stray page number: a short all-digit line at the very
+    top or bottom of the text. Number lines further in are kept (a roll table's "1", "2", ...)."""
+    lines = [words for words in (_words(line) for line in text.splitlines()) if words]
     found: set[int] = set()
     index = 0
-    for line in text.splitlines():
-        words = _words(line)
-        if words and len(words) <= MAX_DROPPED_NUMBER_RUN and all(w.isdigit() for w in words):
+    for position, words in enumerate(lines):
+        at_edge = position == 0 or position == len(lines) - 1
+        if at_edge and len(words) <= MAX_DROPPED_NUMBER_RUN and all(w.isdigit() for w in words):
             found.update(range(index, index + len(words)))
         index += len(words)
     return found

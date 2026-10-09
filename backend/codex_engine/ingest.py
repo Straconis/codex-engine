@@ -56,17 +56,32 @@ def build_source_content(
         if cancel is not None and cancel.is_set():
             raise RuntimeError("Cancelled")
         pages.append(PageContent(raw_text=layout.raw_text, clean_md=text, clean_version=FORMATTER_VERSION))
-        plain = markdown_to_plain(text)
-        chunks.extend(chunk_text(index, first_heading(text) or pick_heading_from_text(plain), plain))
+        chunks.extend(page_chunks(index, text))
         if on_page:
             on_page(index, len(layouts))
     return pages, chunks
 
 
+def page_chunks(page_num: int, markdown: str) -> list[ChunkRow]:
+    """Search chunks for one page's Markdown."""
+    plain = markdown_to_plain(markdown)
+    return chunk_text(page_num, first_heading(markdown) or pick_heading_from_text(plain), plain)
+
+
 def rebuild_source(conn, source_id: int, path: Path) -> None:
     """Re-run extraction + cleanup for an already-ingested book (formatter upgrades)."""
     pages, chunks = build_source_content(extract_layouts(path))
+    # The user's own edits are kept, so search keeps finding what those pages say.
+    edits = {p.page_num: p.edited_md for p in db.edited_pages(conn, source_id) if p.page_num <= len(pages)}
+    chunks = [c for c in chunks if c.page_num not in edits]
+    for page_num, markdown in edits.items():
+        chunks.extend(page_chunks(page_num, markdown))
     db.rebuild_source_content(conn, source_id, pages, chunks)
+
+
+def index_saved_edits(conn) -> None:
+    """Make edits saved before 0.3.10 (which weren't searchable) searchable."""
+    db.reindex_edits(conn, {(p.source_id, p.page_num): page_chunks(p.page_num, p.edited_md) for p in db.edited_pages(conn)})
 
 
 def pick_heading_from_text(page_text: str) -> str | None:
