@@ -32,8 +32,8 @@ def footer(n: int) -> list[Line]:
 
 def test_join_lines_dehyphenates_wrapped_words():
     assert join_lines(["The goblin is a mis-", "chievous creature."]) == "The goblin is a mischievous creature."
-    # A real hyphenated compound followed by a capital stays as-is.
-    assert join_lines(["a half-", "Orc warrior"]) == "a half- Orc warrior"
+    # A compound broken before a capital keeps its hyphen and loses the line break.
+    assert join_lines(["a half-", "Orc warrior"]) == "a half-Orc warrior"
 
 
 def test_headings_from_font_size_and_paragraph_reflow():
@@ -175,7 +175,7 @@ def test_unique_chapter_title_at_top_of_page_is_kept():
 
 
 def test_hyphen_kept_when_next_line_starts_uppercase_or_digit():
-    assert join_lines(["See pre-", "1990 rules"]) == "See pre- 1990 rules"
+    assert join_lines(["See pre-", "1990 rules"]) == "See pre-1990 rules"
     assert join_lines(["imag-", "ination"]) == "imagination"
 
 
@@ -293,3 +293,56 @@ def test_replacement_char_after_a_word_or_between_digits():
 
     assert _clean_text("the creatures\ufffd spaces") == "the creatures' spaces"
     assert _clean_text("Recharge 5\ufffd6") == "Recharge 5\u20136"
+
+
+# ---- 0.3.11: cleanup bugs found in the 0.3.10 sweep -----------------------------
+
+@pytest.mark.parametrize("word", ["MIMIC", "I", "DM", "CIVIC", "mimic", "livid"])
+def test_words_in_the_margin_that_look_like_roman_numerals_are_kept(word):
+    (md,) = format_document([page([line(word, 30, size=16)], [line("Body text.", 300)], [line(word, 790)])])
+    assert md.count(word) == 2
+
+
+def test_lowercase_roman_page_numbers_are_still_removed():
+    for numeral in ("iv", "xii", "xlvii"):
+        (md,) = format_document([page([line("Front matter text.", 300)], [line(numeral, 790)])])
+        assert md == "Front matter text."
+
+
+def test_separate_bold_lines_are_not_merged_into_one_heading():
+    names = [line(t, 100 + i * 14, bold=True) for i, t in enumerate(["Fire Bolt", "Light", "Mage Hand"])]
+    (md,) = format_document([page(names, [line("Cantrips you know.", 200)])])
+    assert md.startswith("#### Fire Bolt\n\n#### Light\n\n#### Mage Hand")
+
+
+def test_a_large_heading_that_wraps_is_still_one_heading():
+    body = [line("Body text that is long enough to be the body size of the page.", 300 + i * 12) for i in range(8)]
+    (md,) = format_document([page([line("The Long Title of", 50, size=20), line("This Chapter", 72, size=20)], body)])
+    assert md.startswith("# The Long Title of This Chapter\n\n")
+
+
+def test_headings_escape_literal_asterisks():
+    (md,) = format_document([page([line("Actions*", 100, bold=True)], [line("Footnoted.", 120)])])
+    assert md.startswith("#### Actions\\*")
+
+
+def test_two_stat_blocks_in_a_row_make_two_tables():
+    tokens = ["STR", "18 (+4)", "DEX", "11 (+0)", "CON", "14 (+2)", "INT", "11 (+0)", "WIS", "10 (+0)", "CHA", "9 (-1)"]
+    halves = [tokens[:6], tokens[6:]] * 2  # STR-CON, INT-CHA, then the next creature's
+    blocks = [[line(t, 100 + b * 80 + i * 10) for i, t in enumerate(half)] for b, half in enumerate(halves)]
+    (md,) = format_document([page(*blocks)])
+    assert md.count("| STR | DEX | CON | INT | WIS | CHA |") == 2 and "STR 18" not in md
+
+
+def test_a_wrapped_line_starting_with_a_number_or_dash_is_not_a_list_item():
+    (md,) = format_document([page([line("Your Armor Class equals", 100), line("15. While wearing it, you", 112), line("can't swim.", 124)])])
+    assert md == "Your Armor Class equals 15. While wearing it, you can't swim."
+    (md,) = format_document([page([line("The knight rode off", 100), line("– and never came back to the castle.", 112)])])
+    assert md == "The knight rode off – and never came back to the castle."
+    (md,) = format_document([page([line("Steps to follow:", 100), line("1. Draw.", 112), line("2. Roll.", 124)])])
+    assert md == "Steps to follow:\n\n1. Draw.\n\n2. Roll."
+
+
+def test_search_text_has_no_quote_break_or_emphasis_marks():
+    plain = markdown_to_plain("> quoted\n\n---\n\n_italic_ and *em* but snake_case and 3\\*")
+    assert plain.split() == ["quoted", "italic", "and", "em", "but", "snake_case", "and", "3*"]

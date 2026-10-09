@@ -94,31 +94,50 @@ def test_changing_a_single_word_in_a_long_section_is_rejected():
         check_faithful(src, src.replace("torrents", "torrent", 1))  # "modernised"/corrected
 
 
-def test_rejoining_split_words_is_allowed():
-    check_faithful("a sense of imag ination and won der " + PROSE, "a sense of imagination and wonder " + PROSE)
+def test_rejoining_words_split_across_lines_is_allowed():
+    check_faithful("a sense of imag-\nination and won\nder " + PROSE, "a sense of imagination and wonder " + PROSE)
+
+
+@pytest.mark.parametrize(
+    "src, bad",
+    [
+        ("The therapist arrives.", "The the rapist arrives."),
+        ("You can not cast it.", "You cannot cast it."),
+        ("Every one of them dies.", "Everyone of them dies."),
+        ("a sense of imag ination", "a sense of imagination"),  # a space is the author's, even if it looks wrong
+        ("a sense of imag-\nination", "a sense of ima gination"),  # never split one word into several
+    ],
+)
+def test_splitting_or_merging_real_words_is_rejected(src, bad):
+    with pytest.raises(AIFormatError, match="changed words"):
+        check_faithful(FOREST + src, FOREST + bad)
 
 
 FOREST_INTRO = "The party travels through the dark forest toward the ruined keep on the hill. " * 3
 
 
-def test_only_a_bare_page_number_may_be_dropped():
+def test_no_number_may_be_dropped_not_even_a_page_number():
+    # Cleanup strips page numbers before the AI sees the text, so the AI has nothing to remove.
     body = " ".join([PROSE] * 4)
-    check_faithful("12\n" + body, body)  # stray page number on its own line
-    check_faithful(body + "\n\n12", body)
-    with pytest.raises(AIFormatError, match="dropped"):
-        check_faithful("THE TOME OF STORMS " + body, body)  # cleanup already removes real headers
+    for src in ("12\n" + body, body + "\n\n12", "THE TOME OF STORMS " + body):
+        with pytest.raises(AIFormatError, match="dropped"):
+            check_faithful(src, body)
     sentence = "Then the old wizard opened the door and walked slowly out into the pouring rain alone."
     with pytest.raises(AIFormatError, match="dropped"):
         check_faithful(body + " " + sentence + " " + body, body + " " + body)
 
 
-def test_number_lines_inside_a_section_are_not_page_numbers():
+def test_number_lines_are_kept_wherever_they_are():
     # A roll table: each entry's number sits on its own line, like a page number would.
     table = "\n".join(f"{n}\nThe party meets a wandering merchant with strange wares." for n in range(1, 7))
     src = FOREST_INTRO + "\n" + table + "\n" + FOREST_INTRO
     with pytest.raises(AIFormatError, match="dropped text .*'3'"):
         check_faithful(src, src.replace("\n3\n", "\n"))
-    check_faithful("212\n" + src + "\n213", src)  # real page numbers at the edges still go
+    # The end of a section is not the end of a page: a stat there must stay (0.3.10 let it go).
+    with pytest.raises(AIFormatError, match="dropped text .*'15'"):
+        check_faithful(FOREST_INTRO + "\nArmor Class\n15", FOREST_INTRO + "\nArmor Class")
+    with pytest.raises(AIFormatError, match="dropped text .*'1 2 3'"):
+        check_faithful("1 2 3\n" + FOREST_INTRO, FOREST_INTRO)
 
 
 # Real output from qwen2.5:1.5b on Monsters of the Multiverse p. 276 that the old check accepted.
@@ -151,7 +170,7 @@ FOREST = "The party travels through the dark forest toward the ruined keep on th
         (FOREST + "Roll 12 dice.", FOREST + "Roll dice.", "dropped text .*'12'"),  # a number mid-sentence is not a page number
         (FOREST + "On a roll of 1-2 the spell fails.", FOREST + "On a roll of 12 the spell fails.", "changed words .*'1 2' -> '12'"),
         (FOREST + "Roll 1 0 dice.", FOREST + "Roll 10 dice.", "changed words"),
-        (FOREST + "Carry a ten-foot pole.", FOREST + "Carry a tenfoot pole.", "removed '-'"),
+        (FOREST + "Carry a ten-foot pole.", FOREST + "Carry a tenfoot pole.", "changed words .*'ten foot' -> 'tenfoot'"),
         (FOREST + "Apply a -2 penalty.", FOREST + "Apply a 2 penalty.", "removed '-'"),
     ],
 )
@@ -496,3 +515,81 @@ def test_describe_changes_spots_an_already_formatted_page():
     info = describe_changes("ARMOR CLASS 15\nHit Points 7", "## ARMOR CLASS 15\n\n**Hit Points** 7")
     assert info["meaningful"] is True and info["markup"] == 6 and info["line_breaks"] >= 1
     assert info["summary"].startswith("Layout changed on") and info["summary"].endswith("The words are unchanged.")
+
+
+# ---- 0.3.11: holes found in the 0.3.10 sweep ----------------------------------------
+
+@pytest.mark.parametrize(
+    "src, bad, reason",
+    [
+        (FOREST + "Name: ______ Class: ______", FOREST + "Name: Class:", "removed '___'"),  # fill-in blanks
+        (FOREST + "Cast fireball\\*, then haste.", FOREST + "Cast fireball, then haste.", r"removed '\*'"),  # footnote
+        (FOREST + "Take item #3 from the chest.", FOREST + "Take item 3 from the chest.", "removed '#'"),
+    ],
+)
+def test_the_authors_own_symbols_cannot_be_removed(src, bad, reason):
+    with pytest.raises(AIFormatError, match=reason):
+        check_faithful(src, bad)
+
+
+def test_markup_symbols_are_still_layout():
+    check_faithful(FOREST + "Take item #3.\n\nGear", "### " + FOREST + "Take item #3.\n\n## Gear")
+    check_faithful(FOREST + "Name: ______", FOREST + "**Name:** ______")
+    check_faithful(FOREST + "a snake_case_name and __bold__", FOREST + "a snake_case_name and **bold**")
+
+
+def test_a_section_without_words_still_gets_checked():
+    with pytest.raises(AIFormatError, match="added text"):
+        check_faithful("* * *", "I added a story.")
+    check_faithful("* * *", "---")
+
+
+@pytest.mark.parametrize("reply", ["```\n{t}", "```\n{t}```", "```markdown\r\n{t}\r\n```", "```\n{t}\n```"])
+def test_code_fences_are_stripped_in_any_form(reply):
+    assert ai_format.strip_fences(reply.format(t=PROSE)) == PROSE
+
+
+def test_a_fence_left_in_the_output_is_rejected():
+    with pytest.raises(AIFormatError, match="code fence"):
+        check_faithful(PROSE, PROSE + "\n```")
+
+
+def test_short_sections_may_gain_markup():
+    check_faithful("Gear", "### Gear")
+    check_faithful("STR DEX\n18 (+4) 11 (+0)", "| STR | DEX |\n|---|---|\n| 18 (+4) | 11 (+0) |")
+
+
+def test_the_same_accent_written_two_ways_is_the_same_text():
+    check_faithful(FOREST + "Le café est ouvert.", FOREST + "Le café est ouvert.")
+
+
+def test_status_reports_a_bad_setting_instead_of_raising(monkeypatch):
+    monkeypatch.setenv("CODEX_ENGINE_AI_NUM_CTX", "8k")
+    status = ai_format.status(client=FakeClient())
+    assert status["available"] is False and "isn't valid" in status["error"]
+
+
+def test_describe_changes_is_fast_on_a_long_page():
+    import time
+
+    source = "\n".join(f"Line {i} of a long page with some words on it." for i in range(300))  # ~14k chars
+    output = "## " + source.replace("Line 1", "**Line** 1")
+    started = time.perf_counter()
+    info = describe_changes(source, output)
+    assert time.perf_counter() - started < 2 and info["markup"] > 0
+
+
+def test_split_and_rebuild_keep_exact_spacing():
+    text = "  " + PROSE + "  Two spaces.\n\n\n\n" + ("Sentence one.  Sentence two. " * 20) + "\n\n \n\nEnd.\n\n"
+    parts = ai_format.section_parts(text, 200)
+    assert all(section.strip() for section, _ in parts)
+    assert format_markdown(text, client=FakeClient(), config=CONFIG).markdown == text
+
+
+def test_a_page_accepted_section_by_section_passes_the_page_check():
+    # 0.3.10 accepted a dropped "15" at the end of a section, then flagged the saved page.
+    page = "\n\n".join([PROSE, "Armor Class\n15", PROSE])
+    result = format_markdown(page, client=FakeClient(lambda t: t.replace("\n15", "")), config=CONFIG)
+    assert result.failed and ai_format.is_faithful(page, result.markdown)
+    result = format_markdown(page, client=FakeClient(lambda t: "# " + t), config=CONFIG)
+    assert not result.failed and ai_format.is_faithful(page, result.markdown)
