@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class SourceRow(BaseModel):
@@ -28,6 +28,10 @@ class SearchRow(BaseModel):
     heading: str | None
     snippet: str
     loc: str | None
+
+
+class SetEnabledArgs(BaseModel):
+    enabled: StrictBool
 
 
 class StartIngestArgs(BaseModel):

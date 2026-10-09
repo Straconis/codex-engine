@@ -11,6 +11,7 @@ import {
   type PageView,
   type SearchRow,
   type SourceRow,
+  type UpdateCheckResult,
   type VersionInfo,
 } from "./api";
 import { highlightText, markedSnippet, queryPattern } from "./highlight";
@@ -39,6 +40,26 @@ const VIEW_LABELS: Record<ReaderView, string> = {
   raw: "Raw extraction",
   changes: "What the AI changed",
 };
+
+// Plain-language result of an update check (or of an apply that didn't start the updater).
+function describeUpdate(update: UpdateCheckResult): string {
+  switch (update.status) {
+    case "current":
+      return `Codex Engine is up to date (${update.current_version}).`;
+    case "no_release":
+      return "No GitHub release is published yet. Create a release and attach the CodexEngineSetup installer to enable updates.";
+    case "missing_installer":
+      return `Update ${update.latest_version} has no installer for this computer yet${
+        update.platform ? ` (${update.platform}` + (update.expected_asset ? `, expected ${update.expected_asset})` : ")") : ""
+      }.`;
+    case "update_available":
+      return `Update ${update.latest_version} is available.`;
+    case "updater_launched":
+      return "Updater launched. Codex Engine will close to finish updating.";
+    default:
+      return update.message || `Unexpected update status "${String((update as { status?: unknown }).status)}".`;
+  }
+}
 
 const SEARCH_LIMIT = 50; // the backend returns at most this many results
 
@@ -69,12 +90,21 @@ export default function App() {
   const [results, setResults] = useState<SearchRow[]>([]);
   const [status, setStatus] = useState<string>("");
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  // Update check/apply results get their own line in Settings > Updates.
+  const [updateStatus, setUpdateStatus] = useState("");
+  const updateBusy = useRef(false); // a check or apply is in flight (state alone can't stop a fast double click)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
 
   // Ingest modal state
   const [ingestOpen, setIngestOpen] = useState(false);
   const [ingestPath, setIngestPath] = useState("");
-  const [ingestId, setIngestId] = useState<number | null>(null);
+  const [ingestId, setIngestIdState] = useState<number | null>(null);
+  // Read by the long-lived event stream; kept in step with the state by setIngestId.
+  const ingestIdRef = useRef<number | null>(null);
+  function setIngestId(id: number | null) {
+    ingestIdRef.current = id;
+    setIngestIdState(id);
+  }
   const [progress, setProgress] = useState<IngestProgress | null>(null);
   // Plain-language history of the current import (one line per step) and when it started.
   const [ingestLog, setIngestLog] = useState<{ at: number; message: string }[]>([]);
@@ -126,6 +156,7 @@ export default function App() {
   const [matchCount, setMatchCount] = useState(0);
   const [aiStatus, setAiStatus] = useState<AIStatus | null>(null);
   const readerRequest = useRef(0); // ignore responses for pages we've navigated away from
+  const searchRequest = useRef(0); // ignore responses for searches that were superseded (or cleared)
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [modelPull, setModelPull] = useState<ModelPull | null>(null);
@@ -193,6 +224,13 @@ export default function App() {
 
     events.addEventListener("ingest_progress", (event) => {
       const p = JSON.parse((event as MessageEvent).data) as IngestProgress;
+      // Once the current ingest's id is known, other ingests' events don't belong in its window.
+      const current = ingestIdRef.current;
+      if (current !== null && typeof p.id === "number" && p.id !== current) {
+        uiLog(`ingest_progress ignored id=${p.id} (showing ${current})`);
+        if (p.done) refreshSources(); // it may still have added a source
+        return;
+      }
       setProgress(p);
       setIngestLog((log) => {
         // One line per step: per-page updates within a step replace the step's line.
@@ -203,7 +241,7 @@ export default function App() {
         return sameStep ? [...log.slice(0, -1), entry] : [...log, entry].slice(-50);
       });
       uiLog(`ingest_progress id=${p.id} stage=${p.stage} ${p.current}/${p.total} done=${p.done} msg=${p.message}`);
-      if (typeof p.id === "number") setIngestId((current) => current ?? p.id);
+      if (current === null && typeof p.id === "number") setIngestId(p.id);
       if (p.done) refreshSources();
     });
 
@@ -290,11 +328,13 @@ export default function App() {
   async function runSearch() {
     const q = query.trim();
     if (!q) return;
+    const requestId = ++searchRequest.current;
 
     try {
       uiLog(`search start query="${q}"`);
       setStatus("Searching…");
       const rows = await api.search(q);
+      if (requestId !== searchRequest.current) return;
       setResults(rows);
       setSearchedFor(q);
       setStatus(
@@ -306,53 +346,58 @@ export default function App() {
       );
       uiLog(`search ok query="${q}" results=${rows.length}`);
     } catch (e: any) {
+      if (requestId !== searchRequest.current) return;
       uiLog(`search failed query="${q}" ${String(e)}`);
       setStatus(`Search failed: ${String(e)}`);
     }
   }
 
   async function checkForUpdates() {
+    if (updateBusy.current) return;
+    updateBusy.current = true;
+    let launched = false;
+    let applying = false;
     try {
       uiLog("update_check start");
       setCheckingUpdates(true);
-      setStatus("Checking GitHub for updates...");
+      setUpdateStatus("Checking GitHub for updates...");
       const update = await api.checkForUpdate();
       uiLog(`update_check result status=${update.status} current=${update.current_version} latest=${update.latest_version}`);
 
-      if (update.status === "current") {
-        setStatus(`Codex Engine is up to date (${update.current_version}).`);
+      if (update.status !== "update_available") {
+        setUpdateStatus(describeUpdate(update));
         return;
       }
 
-      if (update.status === "no_release") {
-        setStatus("No GitHub release is published yet. Create a release and attach the CodexEngineSetup installer to enable updates.");
+      const shouldUpdate = confirm(
+        `Codex Engine ${update.latest_version} is available. Download and install it now? The app will close while updating.`
+      );
+      if (!shouldUpdate) {
+        setUpdateStatus(describeUpdate(update));
         return;
       }
 
-      if (update.status === "missing_installer") {
-        setStatus(`Version ${update.latest_version} is available, but no ${update.platform ?? "current platform"} installer asset was found${update.expected_asset ? ` (${update.expected_asset})` : ""}.`);
+      applying = true;
+      setUpdateStatus(`Downloading Codex Engine ${update.latest_version}...`);
+      // The backend re-checks GitHub; it reports "updater_launched" only when the updater really started.
+      const result = await api.applyUpdate();
+      uiLog(`update_apply result status=${result.status} latest=${result.latest_version}`);
+      if (result.status !== "updater_launched") {
+        setUpdateStatus(`The update didn't start. ${describeUpdate(result)}`);
         return;
       }
-
-      if (update.status === "update_available") {
-        const shouldUpdate = confirm(
-          `Codex Engine ${update.latest_version} is available. Download and install it now? The app will close while updating.`
-        );
-        if (!shouldUpdate) {
-          setStatus(`Update ${update.latest_version} is available.`);
-          return;
-        }
-
-        setStatus(`Downloading Codex Engine ${update.latest_version}...`);
-        await api.applyUpdate();
-        setStatus("Updater launched. Codex Engine will close to finish updating.");
-        setTimeout(() => window.close(), 750);
-      }
+      launched = true;
+      setUpdateStatus(describeUpdate(result));
+      setTimeout(() => window.close(), 750);
     } catch (e: any) {
-      uiLog(`update_check failed ${String(e)}`);
-      setStatus(`Update check failed: ${String(e)}`);
+      uiLog(`${applying ? "update_apply" : "update_check"} failed ${String(e)}`);
+      setUpdateStatus(`${applying ? "Update failed" : "Update check failed"}: ${String(e).replace(/^Error: /, "")}`);
     } finally {
-      setCheckingUpdates(false);
+      // Once the updater is running the app is closing: keep the button disabled.
+      if (!launched) {
+        updateBusy.current = false;
+        setCheckingUpdates(false);
+      }
     }
   }
 
@@ -557,6 +602,7 @@ export default function App() {
     cancelAiFormat();
   }
 
+  // Also the progress window's "Show page": same guards (no jumping mid "Reformat all", no lost edits).
   function openBookPage(sourceId: number, page: number) {
     if (bookRunning || !confirmDiscardEdit()) return;
     setBookCheck(null); // the reader opens underneath this window
@@ -581,17 +627,29 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [aiRun?.finished?.kind]);
 
+  // The page shown is the page the reader points at (not a previous page still on screen while loading).
+  function readerShowsItsPage(): boolean {
+    return Boolean(
+      reader && readerPage && !readerLoading && readerPage.source_id === reader.sourceId && readerPage.page_num === reader.page
+    );
+  }
+
   async function saveEdit() {
-    if (!reader || !editing) return;
+    if (!reader || !editing || savingEdit || !readerShowsItsPage()) return;
+    // Captured now: if the reader moves on while saving, the response belongs to this page, not that one.
+    const { sourceId, page } = reader;
+    const requestId = readerRequest.current;
     setSavingEdit(true);
     try {
-      const data = await api.saveEdit(reader.sourceId, reader.page, editing.text);
+      const data = await api.saveEdit(sourceId, page, editing.text);
+      uiLog(`page_edit saved source=${sourceId} page=${page}`);
+      if (requestId !== readerRequest.current) return; // saved on its own page; the reader shows another
       setReaderPage(data);
       setReaderView("edited");
       setEditing(null);
       setAiDecision(null);
-      uiLog(`page_edit saved source=${reader.sourceId} page=${reader.page}`);
     } catch (e: any) {
+      if (requestId !== readerRequest.current) return;
       setReaderError(`Couldn't save your edit: ${String(e).replace(/^Error: /, "")}`);
     } finally {
       setSavingEdit(false);
@@ -599,18 +657,25 @@ export default function App() {
   }
 
   async function revertEdit() {
-    if (!reader || !confirm("Remove your edit and go back to the automatic version of this page?")) return;
+    if (!reader || !readerShowsItsPage()) return;
+    const { sourceId, page } = reader;
+    const requestId = readerRequest.current;
+    if (!confirm("Remove your edit and go back to the automatic version of this page?")) return;
+    if (requestId !== readerRequest.current) return;
     try {
-      const data = await api.revertEdit(reader.sourceId, reader.page);
+      const data = await api.revertEdit(sourceId, page);
+      uiLog(`page_edit reverted source=${sourceId} page=${page}`);
+      if (requestId !== readerRequest.current) return;
       setReaderPage(data);
       setReaderView(data.best);
     } catch (e: any) {
+      if (requestId !== readerRequest.current) return;
       setReaderError(`Couldn't revert: ${String(e).replace(/^Error: /, "")}`);
     }
   }
 
   function startEdit(text?: string) {
-    if (!readerPage) return;
+    if (!readerPage || !readerShowsItsPage()) return;
     const current =
       text ??
       (readerView === "edited" && readerPage.edited_md != null
@@ -623,21 +688,41 @@ export default function App() {
     setEditing({ text: current, original: current });
   }
 
-  // Jump to the first search match whenever a page (or text version) is shown.
+  // Jump to the first search match whenever a page (or text version, or its text) is shown.
+  // Keyed on whether an edit is open, not on its text: typing must not scroll the reader.
+  const isEditing = editing !== null;
   useEffect(() => {
     const body = readerBodyRef.current;
-    if (!body || !readerPage) return;
+    if (!body || !readerPage || isEditing) return;
     const marks = body.querySelectorAll("mark");
     setMatchCount(marks.length);
     if (marks.length) marks[0].scrollIntoView({ block: "center" });
     else body.scrollTop = 0;
-  }, [readerPage?.source_id, readerPage?.page_num, readerPage?.ai_md, readerView, highlight]);
+  }, [
+    readerPage?.source_id,
+    readerPage?.page_num,
+    readerPage?.edited_md,
+    readerPage?.clean_md,
+    readerPage?.ai_md,
+    readerPage?.raw_text,
+    readerView,
+    isEditing,
+    highlight,
+  ]);
 
+  // Reader shortcuts, only while the reader is the top-most window: Settings, the ingest, book
+  // check and duplicate windows all open above it.
+  const readerOnTop = Boolean(reader) && !settingsOpen && !ingestOpen && !bookCheck && !(dupOpen && dup);
   useEffect(() => {
-    if (!reader) return;
+    if (!readerOnTop) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || readerLoading) return;
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
+      if (
+        target &&
+        (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.tagName === "SELECT" || target.isContentEditable)
+      )
+        return;
       if (e.key === "Escape") closeReader();
       else if (e.key === "ArrowLeft") turnReaderPage(-1);
       else if (e.key === "ArrowRight") turnReaderPage(1);
@@ -679,7 +764,7 @@ export default function App() {
     } catch (e: any) {
       setStatus(`Ingest start failed: ${String(e)}`);
       setProgress({
-        id: ingestId ?? -1,
+        id: -1,
         stage: "error",
         message: "Ingest failed to start",
         current: 0,
@@ -714,7 +799,7 @@ export default function App() {
     } catch (e: any) {
       setStatus(`Upload failed: ${String(e)}`);
       setProgress({
-        id: ingestId ?? -1,
+        id: -1,
         stage: "error",
         message: "Upload failed",
         current: 0,
@@ -1142,8 +1227,10 @@ export default function App() {
             <button
               className="btn"
               onClick={() => {
+                searchRequest.current++; // a search still running must not refill the list
                 setQuery("");
                 setResults([]);
+                setSearchedFor("");
                 setStatus("");
               }}
             >
@@ -1197,7 +1284,7 @@ export default function App() {
                       ? " • fails the current text check"
                       : " • outdated, reformat to refresh"
                     : ""}
-                  {readerPage && searchedFor
+                  {readerPage && searchedFor && readerView !== "changes" && !editing
                     ? ` • ${matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"}` : "no matches"} for “${searchedFor.replace(/"/g, "")}”`
                     : ""}
                 </div>
@@ -1297,14 +1384,19 @@ export default function App() {
 
               <div className="spacer" />
               {readerView === "edited" && !editing && (
-                <button className="btn small" onClick={revertEdit} title="Go back to the automatic (AI or cleaned) version">
+                <button
+                  className="btn small"
+                  onClick={revertEdit}
+                  disabled={readerLoading}
+                  title="Go back to the automatic (AI or cleaned) version"
+                >
                   Revert edit
                 </button>
               )}
               <button
                 className="btn small"
                 onClick={() => startEdit()}
-                disabled={!readerPage || Boolean(editing)}
+                disabled={!readerPage || readerLoading || Boolean(editing)}
                 title="Correct this page's text yourself. The PDF and the automatic versions are kept."
               >
                 Edit page
@@ -1397,7 +1489,12 @@ export default function App() {
                 readerView === "raw" ? (
                   <pre className="rawText">{highlightText(readerPage.raw_text ?? "", highlight)}</pre>
                 ) : readerView === "changes" && readerPage.ai_md ? (
-                  <ChangesView before={readerPage.clean_md} after={readerPage.ai_md} />
+                  <ChangesView
+                    before={readerPage.clean_md}
+                    after={readerPage.ai_md}
+                    aiStale={readerPage.ai_stale}
+                    aiCheckFailed={Boolean(readerPage.ai_check_failed)}
+                  />
                 ) : (
                   <Markdown
                     text={
@@ -1422,10 +1519,7 @@ export default function App() {
           readerOnPage={Boolean(reader && reader.sourceId === aiRun.sourceId && reader.page === aiRun.page)}
           onCancel={cancelAiFormat}
           onClose={() => setAiRun(null)}
-          onShowPage={() => {
-            setReaderPage(null);
-            loadReaderPage(aiRun.sourceId, aiRun.page);
-          }}
+          onShowPage={() => openBookPage(aiRun.sourceId, aiRun.page)}
         />
       )}
 
@@ -1444,7 +1538,7 @@ export default function App() {
             onLogToFileChange: setLogToFile,
             onCheckUpdates: checkForUpdates,
             checkingUpdates,
-            updateStatus: status,
+            updateStatus,
             versionText: `UI ${FRONTEND_VERSION} • API ${versionInfo?.backend_version ?? "..."} • Updater ${versionInfo?.updater_version ?? "..."}${
               versionInfo ? ` • ${versionInfo.platform}${versionInfo.updater_present ? "" : " • updater missing"}` : ""
             }`,

@@ -132,14 +132,18 @@ def list_sources(conn: sqlite3.Connection) -> list[SourceRow]:
     return [SourceRow(**dict(row)) for row in rows]
 
 
-def set_source_enabled(conn: sqlite3.Connection, source_id: int, enabled: bool) -> None:
-    conn.execute("UPDATE sources SET enabled=? WHERE id=?", (1 if enabled else 0, source_id))
+def set_source_enabled(conn: sqlite3.Connection, source_id: int, enabled: bool) -> bool:
+    """False if there is no such source."""
+    cur = conn.execute("UPDATE sources SET enabled=? WHERE id=?", (1 if enabled else 0, source_id))
     conn.commit()
+    return cur.rowcount > 0
 
 
-def delete_source(conn: sqlite3.Connection, source_id: int) -> None:
-    conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
+def delete_source(conn: sqlite3.Connection, source_id: int) -> bool:
+    """False if there is no such source."""
+    cur = conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
     conn.commit()
+    return cur.rowcount > 0
 
 
 def get_source_by_hash(conn: sqlite3.Connection, sha256: str) -> SourceRow | None:
@@ -285,6 +289,16 @@ def get_page(conn: sqlite3.Connection, source_id: int, page_num: int) -> PageRow
     return PageRow(**dict(row)) if row else None
 
 
+def pages_with_user_work_after(conn: sqlite3.Connection, source_id: int, last_page: int) -> list[int]:
+    """Pages past `last_page` that hold an edit or an AI version."""
+    rows = conn.execute(
+        "SELECT page_num FROM pages WHERE source_id=? AND page_num>? AND (edited_md IS NOT NULL OR ai_md IS NOT NULL) "
+        "ORDER BY page_num",
+        (source_id, last_page),
+    ).fetchall()
+    return [r["page_num"] for r in rows]
+
+
 def pages_with_ai(conn: sqlite3.Connection, source_id: int) -> list[PageRow]:
     rows = conn.execute(f"{_PAGE_SELECT} WHERE source_id=? AND ai_md IS NOT NULL ORDER BY page_num", (source_id,)).fetchall()
     return [PageRow(**dict(r)) for r in rows]
@@ -373,7 +387,7 @@ def source_path_in_use(conn: sqlite3.Connection, path: str) -> bool:
 # Invisible markers around matched terms in search snippets; the UI turns them into highlights.
 MATCH_START, MATCH_END = "\x02", "\x03"
 
-_QUERY_TOKEN_RE = re.compile(r'"[^"]*"|\S+')
+_QUERY_TOKEN_RE = re.compile(r'"[^"]*"\*?|\S+')
 
 
 def build_match_query(raw: str) -> str:
@@ -385,9 +399,12 @@ def build_match_query(raw: str) -> str:
     keeps prefix search working (e.g. `necro*`).
     """
     terms: list[str] = []
-    for token in _QUERY_TOKEN_RE.findall(raw or ""):
+    raw = "".join(ch if ch.isprintable() else " " for ch in raw or "")  # NUL etc. break FTS5 strings
+    for token in _QUERY_TOKEN_RE.findall(raw):
         prefix = False
-        if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        if len(token) >= 3 and token.startswith('"') and token.endswith('"*'):
+            phrase, prefix = token[1:-2], True  # "fire bol"* : a phrase whose last word is a prefix
+        elif len(token) >= 2 and token.startswith('"') and token.endswith('"'):
             phrase = token[1:-1]
         else:
             phrase = token.replace('"', "")
@@ -407,15 +424,23 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[Search
     match = build_match_query(query)
     if not match:
         return []
+    # Chunks overlap, so one page can match twice; keep each page's best chunk.
     rows = conn.execute(
         """
-        SELECT s.id AS source_id, s.title AS source_title, s.path AS source_path,
-               c.page_num, c.heading, snippet(chunks_fts, 0, ?, ?, '…', 48) AS snippet, c.loc
-        FROM chunks_fts
-        JOIN chunks c ON c.id = chunks_fts.rowid
-        JOIN sources s ON s.id = c.source_id
-        WHERE s.enabled = 1 AND chunks_fts MATCH ?
-        ORDER BY bm25(chunks_fts) ASC
+        WITH hits AS (
+          SELECT s.id AS source_id, s.title AS source_title, s.path AS source_path,
+                 c.page_num, c.heading, snippet(chunks_fts, 0, ?, ?, '…', 48) AS snippet, c.loc,
+                 bm25(chunks_fts) AS rank
+          FROM chunks_fts
+          JOIN chunks c ON c.id = chunks_fts.rowid
+          JOIN sources s ON s.id = c.source_id
+          WHERE s.enabled = 1 AND chunks_fts MATCH ?
+        ), ranked AS (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY source_id, page_num ORDER BY rank) AS nth FROM hits
+        )
+        SELECT source_id, source_title, source_path, page_num, heading, snippet, loc
+        FROM ranked WHERE nth = 1
+        ORDER BY rank ASC
         LIMIT ?
         """,
         (MATCH_START, MATCH_END, match, limit),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,20 +25,22 @@ def current_platform() -> tuple[str, str, str]:
     return PLATFORM_ASSETS.get(sys.platform, (sys.platform, "", ""))
 
 
+_VERSION_RE = re.compile(r"^\s*[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
+
 def normalize_version(version: str) -> tuple[int, int, int]:
-    version = version.strip()
-    if version.lower().startswith("v"):
-        version = version[1:]
-    parts = version.split(".")
-    numbers: list[int] = []
-    for part in parts:
-        try:
-            numbers.append(int("".join(ch for ch in part if ch.isdigit()) or "0"))
-        except ValueError:
-            numbers.append(0)
-    while len(numbers) < 3:
-        numbers.append(0)
-    return tuple(numbers[:3])
+    """(major, minor, patch). A suffix ("-rc1", "+build7") is ignored, never read as digits:
+    "0.4.0-rc1" is 0.4.0, not 0.4.1."""
+    match = _VERSION_RE.match(version)
+    if not match:
+        return (0, 0, 0)
+    major, minor, patch = (int(part or 0) for part in match.groups())
+    return (major, minor, patch)
+
+
+def can_apply_updates() -> bool:
+    """Only the Windows app can install an update itself; elsewhere the user downloads it."""
+    return sys.platform == "win32"
 
 
 def get_latest_release() -> dict:

@@ -21,12 +21,12 @@ from .config import APP_VERSION
 from .events import EventBroker
 from .formatting import FORMATTER_VERSION
 from .ingest import IngestManager, index_saved_edits, page_chunks, rebuild_source
-from .models import AIFormatArgs, EditPageArgs, OpenPdfArgs, PullModelArgs, ResolveDuplicateArgs, StartIngestArgs
-from .ollama_manager import OllamaManager
+from .models import AIFormatArgs, EditPageArgs, OpenPdfArgs, PullModelArgs, ResolveDuplicateArgs, SetEnabledArgs, StartIngestArgs
+from .ollama_manager import OLLAMA_SETTINGS, OllamaManager
 from .platforming import app_data_dir, database_path, open_file_at_page
 from .settings import SettingsStore
 from .uploads import store_upload
-from .updater.update_client import check_for_update, cleanup_update_files, download_installer, launch_updater
+from .updater.update_client import can_apply_updates, check_for_update, cleanup_update_files, download_installer, launch_updater
 
 # Every state-changing request must carry this header. A custom header forces a CORS
 # preflight, so random web pages open in the user's browser can't fire "simple"
@@ -187,10 +187,17 @@ def check_update():
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+_update_lock = threading.Lock()
+
+
 @app.post("/api/update/apply")
 def apply_update(payload: dict | None = None):
     # Never trust an installer URL handed in by the client: re-resolve it from GitHub
     # here. The payload is accepted only for backwards compatibility and ignored.
+    if not can_apply_updates():
+        raise HTTPException(status_code=400, detail="Automatic updates are only available in the Windows app. Download the new version from GitHub.")
+    if not _update_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="An update is already being downloaded.")
     try:
         update = check_for_update()
         if update.get("status") != "update_available":
@@ -200,6 +207,8 @@ def apply_update(payload: dict | None = None):
         return {**update, "status": "updater_launched", "installer_path": installer_path}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        _update_lock.release()
 
 
 @app.get("/api/sources")
@@ -212,10 +221,11 @@ def list_sources():
 
 
 @app.patch("/api/sources/{source_id}/enabled")
-def set_source_enabled(source_id: int, payload: dict):
+def set_source_enabled(source_id: int, args: SetEnabledArgs):
     conn = _conn()
     try:
-        db.set_source_enabled(conn, source_id, bool(payload.get("enabled")))
+        if not db.set_source_enabled(conn, source_id, args.enabled):
+            raise HTTPException(status_code=404, detail="Source not found.")
         return {"ok": True}
     finally:
         conn.close()
@@ -225,7 +235,8 @@ def set_source_enabled(source_id: int, payload: dict):
 def delete_source(source_id: int):
     conn = _conn()
     try:
-        db.delete_source(conn, source_id)
+        if not db.delete_source(conn, source_id):
+            raise HTTPException(status_code=404, detail="Source not found.")
         return {"ok": True}
     finally:
         conn.close()
@@ -233,6 +244,7 @@ def delete_source(source_id: int):
 
 _rebuild_locks: dict[int, threading.Lock] = {}
 _rebuild_locks_guard = threading.Lock()
+_failed_rebuilds: dict[int, tuple[str, int]] = {}  # source id -> (path, mtime) of a rebuild that failed
 
 
 def _ensure_pages_current(conn, source) -> None:
@@ -255,11 +267,26 @@ def _ensure_pages_current(conn, source) -> None:
             if version is None:
                 raise HTTPException(status_code=404, detail=f"The original PDF is missing, so this page can't be shown: {source.path}")
             return
+        attempt = (str(path), path.stat().st_mtime_ns)
+        if _failed_rebuilds.get(source.id) == attempt and version is not None:
+            return  # failed on this exact file before; keep the stored pages until it changes
         try:
             rebuild_source(conn, source.id, path)
         except Exception as exc:
+            _failed_rebuilds[source.id] = attempt
+            print(f"Rebuilding pages of source {source.id} from {path} failed: {exc}", file=sys.stderr)
             if version is None:
                 raise HTTPException(status_code=400, detail=f"Could not read the PDF to build pages: {exc}") from exc
+        else:
+            _failed_rebuilds.pop(source.id, None)
+
+
+def _page_or_404(conn, source_id: int, page_num: int):
+    """The page as stored now; 404 if its book was deleted meanwhile (e.g. during AI formatting)."""
+    page = db.get_page(conn, source_id, page_num)
+    if not page:
+        raise HTTPException(status_code=404, detail="This book was removed from the library.")
+    return page
 
 
 def _load_page(conn, source_id: int, page_num: int):
@@ -402,15 +429,18 @@ def get_settings():
 
 @app.put("/api/settings")
 def update_settings(changes: dict = Body(...)):
+    before = settings_store.load()
     try:
         saved = settings_store.update(changes)
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'settings'}: {e['msg'].removeprefix('Value error, ')}" for e in exc.errors())
         raise HTTPException(status_code=422, detail=problems) from exc
-    # Stop the old Ollama before replying, so nothing that follows (e.g. a model download)
-    # can reach it mid-restart; the new one (new folder/port) starts in the background.
-    ollama.apply(start=False)
-    threading.Thread(target=ollama.ensure_running, daemon=True).start()
+    # Restart Ollama only when a setting it runs with changed: a restart cuts off any
+    # formatting or model download in progress. Stop the old one before replying, so
+    # nothing that follows can reach it mid-restart; the new one starts in the background.
+    if any(getattr(before, key) != getattr(saved, key) for key in OLLAMA_SETTINGS):
+        ollama.apply(start=False)
+        threading.Thread(target=ollama.ensure_running, daemon=True).start()
     return {"settings": saved.model_dump(), "path": str(settings_store.path)}
 
 
@@ -481,7 +511,7 @@ def ai_format_page(source_id: int, page_num: int, args: AIFormatArgs | None = No
                 # user chooses to edit the page by hand.
                 "draft_md": result.markdown,
             }
-            return _page_response(source, db.get_page(conn, source_id, page_num), pending)
+            return _page_response(source, _page_or_404(conn, source_id, page_num), pending)
         changes = None
         if result.formatted:
             db.set_page_ai(
@@ -491,7 +521,7 @@ def ai_format_page(source_id: int, page_num: int, args: AIFormatArgs | None = No
             live.log(changes["summary"])
         else:
             db.set_page_ai_error(conn, source_id, page_num, "The AI couldn't format this page without changing it; the cleaned text is kept.")
-        response = _page_response(source, db.get_page(conn, source_id, page_num))
+        response = _page_response(source, _page_or_404(conn, source_id, page_num))
         response["ai_changes"] = changes  # what this run changed, for the progress window
         return response
     finally:
@@ -515,7 +545,7 @@ def save_page_edit(source_id: int, page_num: int, args: EditPageArgs):
     try:
         source, _ = _load_page(conn, source_id, page_num)
         db.set_page_edit(conn, source_id, page_num, args.markdown, page_chunks(page_num, args.markdown))
-        return _page_response(source, db.get_page(conn, source_id, page_num))
+        return _page_response(source, _page_or_404(conn, source_id, page_num))
     finally:
         conn.close()
 
@@ -526,7 +556,7 @@ def revert_page_edit(source_id: int, page_num: int):
     try:
         source, page = _load_page(conn, source_id, page_num)
         db.set_page_edit(conn, source_id, page_num, None, page_chunks(page_num, page.clean_md or ""))
-        return _page_response(source, db.get_page(conn, source_id, page_num))
+        return _page_response(source, _page_or_404(conn, source_id, page_num))
     finally:
         conn.close()
 
@@ -554,7 +584,14 @@ def start_ingest(args: StartIngestArgs):
 def upload_and_ingest(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload must be a PDF file.")
-    target = store_upload(_uploads_dir(), file.filename, file.file)
+    head = file.file.read(1024)
+    file.file.seek(0)
+    if b"%PDF-" not in head:
+        raise HTTPException(status_code=400, detail=f"{file.filename} isn't a PDF (it doesn't start like one).")
+    try:
+        target = store_upload(_uploads_dir(), file.filename, file.file)
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail=f"Couldn't save the uploaded PDF: {exc.strerror or exc}") from exc
     return {"id": ingests.start(str(target)), "path": str(target)}
 
 
@@ -563,8 +600,8 @@ def cancel_ingest(ingest_id: int):
     try:
         ingests.cancel(ingest_id)
         return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
 
 
 @app.post("/api/ingest/duplicate")
@@ -572,7 +609,9 @@ def resolve_duplicate(args: ResolveDuplicateArgs):
     try:
         ingests.resolve_duplicate(args.ingest_id, args.action)
         return {"ok": True}
-    except Exception as exc:
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 import { highlightText } from "./highlight";
 
 // Small Markdown renderer for the page reader. It covers what the backend formatter
@@ -120,11 +120,14 @@ function inline(text: string, keyPrefix = "i", hl: RegExp | null = null): ReactN
 }
 
 // `highlight` marks search terms (see highlight.tsx) in the rendered text.
-export default function Markdown({ text, highlight = null }: { text: string; highlight?: RegExp | null }) {
-  const blocks = parseBlocks(text);
+// Memoized: the reader re-renders on every progress tick, and the page text rarely changes.
+function Markdown({ text, highlight = null }: { text: string; highlight?: RegExp | null }) {
+  const blocks = useMemo(() => parseBlocks(text), [text]);
   if (!blocks.length) return <p className="mdEmpty">This page has no text. It may be an image-only page.</p>;
   return <div className="md">{renderBlocks(blocks, "b", highlight)}</div>;
 }
+
+export default memo(Markdown);
 
 function renderBlocks(blocks: Block[], prefix: string, hl: RegExp | null): ReactNode[] {
   return blocks.map((b, index) => {

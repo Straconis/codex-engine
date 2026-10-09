@@ -76,18 +76,20 @@ class SettingsStore:
     def path(self) -> Path:
         return self._path or settings_path()
 
-    def load(self) -> AppSettings:
-        """Saved settings; anything missing or invalid falls back to its default."""
+    def _stored(self) -> dict:
+        """The settings file as saved (known keys only), whether or not each value is valid now."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return AppSettings()
+            return {}
         if not isinstance(raw, dict):
-            return AppSettings()
+            return {}
+        return {key: value for key, value in raw.items() if key in AppSettings.model_fields}
+
+    def load(self) -> AppSettings:
+        """Saved settings; anything missing or invalid falls back to its default."""
         valid: dict = {}
-        for key, value in raw.items():
-            if key not in AppSettings.model_fields:
-                continue
+        for key, value in self._stored().items():
             try:
                 AppSettings(**{key: value})
             except ValidationError:
@@ -96,11 +98,18 @@ class SettingsStore:
         return AppSettings(**valid)
 
     def update(self, changes: dict) -> AppSettings:
-        """Validate and persist a partial update. Raises ValidationError on bad input."""
+        """Validate and persist a partial update. Raises ValidationError on bad input.
+
+        Only the changed keys are validated and rewritten. A saved value that is invalid
+        right now (an Ollama path on an unplugged drive) is kept for when it works again,
+        instead of being erased by an unrelated change.
+        """
         with self._lock:
-            merged = AppSettings(**{**self.load().model_dump(), **changes})
+            checked = AppSettings(**changes)
+            stored = self._stored()
+            stored.update({key: getattr(checked, key) for key in changes if key in AppSettings.model_fields})
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(merged.model_dump(), indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(stored, indent=2), encoding="utf-8")
             os.replace(tmp, self.path)
-            return merged
+            return self.load()

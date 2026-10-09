@@ -29,7 +29,7 @@ export type GeneralSettings = {
   onLogToFileChange: (on: boolean) => void;
   onCheckUpdates: () => void;
   checkingUpdates: boolean;
-  updateStatus: string;
+  updateStatus: string; // result of the last update check/apply only (not the app-wide status line)
   versionText: string;
 };
 
@@ -329,9 +329,7 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                 </button>
               </div>
               <div className="hint">{general.versionText}</div>
-              {general.updateStatus && /update|release|installer/i.test(general.updateStatus) && (
-                <div className="hint">{general.updateStatus}</div>
-              )}
+              {general.updateStatus && <div className="hint">{general.updateStatus}</div>}
             </div>
             <div className="field">
               <span>Diagnostics</span>
