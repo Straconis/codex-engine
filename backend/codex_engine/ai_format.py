@@ -21,20 +21,21 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 # Bump when SYSTEM_PROMPT changes meaningfully, so cached output from the old prompt isn't reused.
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 
 SYSTEM_PROMPT = """You restore the formatting of text extracted from a book or document (one section at a time) so it displays properly in a reader.
 
 You are a formatter, not an editor. Keep every word of the input exactly as written and in the same order.
 Keep capitalisation, spelling and punctuation exactly as written: do not change ALL-CAPS headings to Title Case.
 Never summarise, paraphrase, shorten, translate, censor, modernise, correct, explain or add content. Do not "improve" the writing.
-Never remove any line or word, even if it looks repeated or unimportant. The only thing you may remove is a bare page number.
+Never remove any line, word, number or symbol, even if it looks repeated, unimportant or like a page number.
 
 Fix presentation only:
 - Rebuild paragraphs: join lines that were broken mid-sentence; separate paragraphs with a blank line.
@@ -47,13 +48,12 @@ Fix presentation only:
 If the text is already well formatted, return it unchanged.
 Output only the formatted Markdown: no preamble, no notes, no code fences."""
 
-# Validation thresholds. The model may not add a single word; markup is not words.
-MIN_KEPT = 0.95  # of the input's words that must appear, in order, in the output
-# The deterministic cleanup already strips running headers/footers, so the model may drop
-# nothing but a stray page number: a line of its own holding at most this many tokens, all digits.
-MAX_DROPPED_NUMBER_RUN = 3
+# Validation. The model may not add, drop or change a single word or mark; markup is not words.
+# The deterministic cleanup already strips page numbers and running headers/footers, so the
+# model has nothing to remove.
 MIN_LENGTH_RATIO = 0.8  # output chars / input chars
 MAX_LENGTH_RATIO = 1.6
+LENGTH_SLACK = 40  # chars; a short section ("Gear" -> "### Gear") may grow by more than the ratio
 
 
 class AIUnavailable(RuntimeError):
@@ -133,7 +133,10 @@ class OllamaClient:
             raise AIUnavailable(f"Ollama not reachable at {self.config.url} ({exc})") from exc
 
     def list_models(self) -> list[str]:
-        return sorted(m["name"] for m in self._request("/api/tags", None, 2.0).get("models", []))
+        try:
+            return sorted(m["name"] for m in self._request("/api/tags", None, 2.0).get("models", []))
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise AIUnavailable(f"Ollama at {self.config.url} sent a model list Codex Engine couldn't read ({exc!r})") from exc
 
     def chat(
         self,
@@ -205,7 +208,10 @@ def pick_model(models: list[str], preferred: str | None) -> str | None:
 
 def status(client: ChatClient | None = None, config: AIConfig | None = None) -> dict:
     """Whether AI formatting is usable right now. Never raises."""
-    config = config or AIConfig.from_env()
+    try:
+        config = config or AIConfig.from_env()
+    except ValueError as exc:
+        return {"available": False, "models": [], "model": None, "error": f"An AI setting isn't valid ({exc})"}
     client = client or OllamaClient(config)
     try:
         models = client.list_models()
@@ -223,59 +229,58 @@ def status(client: ChatClient | None = None, config: AIConfig | None = None) -> 
 
 # ---- validation ---------------------------------------------------------------
 
+_WORD_RE = re.compile(r"[^\W_]+")
+# What may separate the pieces of a word split across lines: a line break (with or without a
+# hyphen), or a hyphen and a space ("imag- ination"). A plain space is the author's.
+_SPLIT_GAP_RE = re.compile(r"-?[ \t]*\n\s*|-[ \t]+")
+
+
 def _words(text: str) -> list[str]:
     # Case-sensitive on purpose: "OGRE BOLT LAUNCHER" -> "Ogre Bolt Launcher" changes the author's text.
-    return re.findall(r"[^\W_]+", text)
+    return _WORD_RE.findall(text)
 
 
-def _page_number_words(text: str) -> set[int]:
-    """Indices (into _words(text)) of a stray page number: a short all-digit line at the very
-    top or bottom of the text. Number lines further in are kept (a roll table's "1", "2", ...)."""
-    lines = [words for words in (_words(line) for line in text.splitlines()) if words]
-    found: set[int] = set()
-    index = 0
-    for position, words in enumerate(lines):
-        at_edge = position == 0 or position == len(lines) - 1
-        if at_edge and len(words) <= MAX_DROPPED_NUMBER_RUN and all(w.isdigit() for w in words):
-            found.update(range(index, index + len(words)))
-        index += len(words)
-    return found
+def _rejoins_split_word(source: str, spans: list[re.Match], before: list[str], after: list[str]) -> bool:
+    """`after` is one word made of `before`, which the source split across a line break.
+
+    "imag-\nination" -> "imagination" is layout. "can not" -> "cannot", "the rapist" ->
+    "therapist" and any split of one word into several change the text. Never digits.
+    """
+    if len(after) != 1 or "".join(before) != after[0] or any(ch.isdigit() for ch in after[0]):
+        return False
+    return all(_SPLIT_GAP_RE.fullmatch(source, a.end(), b.start()) for a, b in zip(spans, spans[1:]))
 
 
 def check_faithful(source: str, output: str) -> None:
     """Raise AIFormatError unless `output` is `source` with only layout changes."""
     if not output.strip():
         raise AIFormatError("the model returned nothing")
-    src, out = _words(source), _words(output)
+    source, output = unicodedata.normalize("NFC", source), unicodedata.normalize("NFC", output)
+    if any(line.lstrip().startswith("```") for line in output.splitlines()):
+        raise AIFormatError("output contains a code fence")
+    spans = list(_WORD_RE.finditer(source))
+    src, out = [m.group() for m in spans], _words(output)
     if not src:
+        if out:
+            raise AIFormatError(f"output added text that isn't in the source ({' '.join(out[:8])!r})")
+        _check_punctuation(source, output)
         return
     ratio = len(output) / max(1, len(source))
-    if not MIN_LENGTH_RATIO <= ratio <= MAX_LENGTH_RATIO:
+    if not MIN_LENGTH_RATIO <= ratio <= MAX_LENGTH_RATIO and abs(len(output) - len(source)) > LENGTH_SLACK:
         raise AIFormatError(f"output length changed too much ({ratio:.0%} of the input)")
-    page_numbers = _page_number_words(source)
     matcher = difflib.SequenceMatcher(None, src, out, autojunk=False)
-    kept_src = 0  # words matched in order (re-joined split words count as kept)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            kept_src += i2 - i1
-        elif tag == "replace":
-            # Only splitting/merging the same letters is allowed ("imag ination" -> "imagination").
-            # Never digits: "1 0" -> "10" changes a number.
+        if tag == "replace":
             before, after = src[i1:i2], out[j1:j2]
-            if "".join(before) != "".join(after) or any(ch.isdigit() for ch in "".join(before)):
+            if not _rejoins_split_word(source, spans[i1:i2], before, after):
                 raise AIFormatError(f"output changed words ({' '.join(before)!r} -> {' '.join(after)!r})")
-            kept_src += i2 - i1
         elif tag == "delete":
-            if not all(i in page_numbers for i in range(i1, i2)):
-                dropped = src[i1:i2]
-                raise AIFormatError(f"output dropped text ({' '.join(dropped[:8])!r}{'...' if len(dropped) > 8 else ''})")
+            dropped = src[i1:i2]
+            raise AIFormatError(f"output dropped text ({' '.join(dropped[:8])!r}{'...' if len(dropped) > 8 else ''})")
         elif tag == "insert":
             added = out[j1:j2]
             context = f" after {src[i1 - 1]!r}" if i1 else ""
             raise AIFormatError(f"output added text that isn't in the source ({' '.join(added[:8])!r}{context})")
-    kept = kept_src / len(src)
-    if kept < MIN_KEPT:
-        raise AIFormatError(f"output dropped, reordered or reworded text ({kept:.0%} of words kept in order)")
     _check_punctuation(source, output)
 
 
@@ -291,6 +296,22 @@ _SAME_MARK = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d
 # belongs to the author.
 SPLIT_HYPHEN = "-\n"
 _TOKEN_RE = re.compile(r"(?P<split>(?<=[^\W\d_])-(?=\s|$))|[^\W_]+|[^\w\s]")
+# The author's own symbols survive the markup removal below: a backslash-escaped mark ("\\*", a
+# footnote) and a fill-in blank ("______") become private-use stand-ins, turned back on output.
+_ESCAPED_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~])")
+_BLANK_RE = re.compile(r"_{3,}")
+_BLANK = "\ue100"
+_HEADING_MARK_RE = re.compile(r"^(\s*(?:>\s*)*)#{1,6}(?=\s|$)")
+
+
+def _protect(match: re.Match) -> str:
+    return chr(0xE000 + ord(match.group(1)))
+
+
+def _unprotect(token: str) -> str:
+    if token == _BLANK:
+        return "___"
+    return chr(ord(token) - 0xE000) if len(token) == 1 and "\ue000" <= token < "\ue080" else token
 
 
 def _text_tokens(markdown: str) -> list[str]:
@@ -302,12 +323,14 @@ def _text_tokens(markdown: str) -> list[str]:
     """
     tokens: list[str] = []
     for line in INVISIBLE_RE.sub("", markdown).translate(_SAME_MARK).splitlines():
-        if _TABLE_RULE_RE.fullmatch(line) or _THEMATIC_BREAK_RE.fullmatch(line):
+        if _TABLE_RULE_RE.fullmatch(line) or (_THEMATIC_BREAK_RE.fullmatch(line) and "_" not in line):
             continue
-        line = re.sub(r"[*#`|\\]", " ", line)
+        line = _BLANK_RE.sub(f" {_BLANK} ", _ESCAPED_RE.sub(_protect, line))
+        line = _HEADING_MARK_RE.sub(r"\1 ", line)  # "# Title" is markup; "item #3" is the author's
+        line = re.sub(r"[*`|\\]", " ", line)
         line = re.sub(r"(?<![^\W_])_|_(?![^\W_])", " ", line)  # emphasis underscores, not snake_case
         line = _LINE_MARKER_RE.sub("", line)
-        tokens.extend(SPLIT_HYPHEN if m.group("split") else m.group() for m in _TOKEN_RE.finditer(line))
+        tokens.extend(SPLIT_HYPHEN if m.group("split") else _unprotect(m.group()) for m in _TOKEN_RE.finditer(line))
     return tokens
 
 
@@ -327,8 +350,6 @@ def _check_punctuation(source: str, output: str) -> None:
         before, after = src[i1:i2], out[j1:j2]
         if tag == "replace" and _rejoined(before, after):
             continue  # a word split across a line re-joined ("imag- ination" -> "imagination")
-        if tag == "delete" and len(before) <= MAX_DROPPED_NUMBER_RUN and all(t.isdigit() for t in before):
-            continue  # a stray page number
         marks_before = [t.strip() for t in before if not t[0].isalnum()]
         marks_after = [t.strip() for t in after if not t[0].isalnum()]
         if marks_before == marks_after:
@@ -344,6 +365,14 @@ def _check_punctuation(source: str, output: str) -> None:
         raise AIFormatError(f"output changed punctuation ({change})")
 
 
+_MARKUP_CHARS = "#*|>`_"
+_LAYOUT_TOKEN_RE = re.compile(r"\n|([#*|>`_])\1*|[^\s#*|>`_]+")
+
+
+def _layout_tokens(text: str) -> list[str]:
+    return [m.group() for m in _LAYOUT_TOKEN_RE.finditer(text)]
+
+
 def describe_changes(source: str, output: str) -> dict:
     """What an accepted AI version changed, for the progress window and reader.
 
@@ -355,11 +384,13 @@ def describe_changes(source: str, output: str) -> dict:
     meaningful = squash(source) != squash(output)
     markup = 0
     line_breaks = 0
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, source, output, autojunk=False).get_opcodes():
+    # Diffed as tokens, not characters: a character diff is quadratic and took ~26 s on a long page.
+    src_tokens, out_tokens = _layout_tokens(source), _layout_tokens(output)
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, src_tokens, out_tokens, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        changed = source[i1:i2] + output[j1:j2]
-        markup += sum(changed.count(ch) for ch in "#*|>`_")
+        changed = src_tokens[i1:i2] + out_tokens[j1:j2]
+        markup += sum(len(t) for t in changed if t[0] in _MARKUP_CHARS)
         line_breaks += changed.count("\n")
     # A line diff, so one inserted line doesn't make every later line count as changed.
     lines_changed = sum(
@@ -391,68 +422,93 @@ def describe_changes(source: str, output: str) -> dict:
 
 
 def strip_fences(text: str) -> str:
-    text = text.strip()
-    match = re.match(r"^```[a-zA-Z]*\n(.*)\n```$", text, flags=re.DOTALL)
-    return match.group(1).strip() if match else text
+    """The reply without a code fence wrapped around it (opening and closing lines are
+    stripped independently: small models often leave one out)."""
+    text = text.replace("\r\n", "\n").strip()
+    text = re.sub(r"\A```[^\n`]*(\n|\Z)", "", text)
+    text = re.sub(r"```[ \t]*\Z", "", text)
+    return text.strip()
 
 
 # ---- sections + caching -----------------------------------------------------------
 
-def _split_long(paragraph: str, max_chars: int) -> list[tuple[str, str]]:
-    """Pieces of an over-long paragraph, each with the separator that preceded it.
+def _pack(units: list[tuple[str, str]], max_chars: int) -> list[tuple[str, str]]:
+    """Greedily join (separator, text) units into pieces of at most ~max_chars.
+
+    Returns (piece, separator before it) pairs; the separators are kept exactly, so
+    "".join(sep + piece) rebuilds the joined text.
+    """
+    pieces: list[tuple[str, str]] = []
+    current: str | None = None
+    current_sep = ""
+    for sep, text in units:
+        if current is not None and len(current) + len(sep) + len(text) > max_chars:
+            pieces.append((current, current_sep))
+            current = None
+        if current is None:
+            current, current_sep = text, sep
+        else:
+            current += sep + text
+    if current is not None:
+        pieces.append((current, current_sep))
+    return pieces
+
+
+def _split_long(paragraph: str, max_chars: int, by_line: bool = True) -> list[tuple[str, str]]:
+    """Pieces of an over-long paragraph, each with the exact separator that preceded it.
 
     Split at line breaks first, then (for a single huge line) after sentence ends, so a long
-    stat block or table can't overflow the model's context. Pieces are re-joined with the
-    same separator, so the page's layout is unchanged.
+    stat block or table can't overflow the model's context. The first piece's separator is "".
     """
     if len(paragraph) <= max_chars:
         return [(paragraph, "")]
-    for separator, units in (("\n", paragraph.split("\n")), (" ", re.split(r"(?<=[.!?:;])\s+", paragraph))):
-        if len(units) > 1:
-            break
-    else:
+    by_line = by_line and "\n" in paragraph
+    split = re.split(r"(\n)" if by_line else r"(?<=[.!?:;])(\s+)", paragraph)
+    if len(split) == 1:
         return [(paragraph, "")]  # one unbreakable run of text: send it whole
-    pieces: list[tuple[str, str]] = []
-    current: list[str] = []
-    size = 0
-    for unit in units:
-        if current and size + len(unit) > max_chars:
-            pieces.append((separator.join(current), separator))
-            current, size = [], 0
-        current.append(unit)
-        size += len(unit) + 1
-    pieces.append((separator.join(current), separator))
-    # A single line can still be too long; split it by sentences. The first piece has no separator.
+    units: list[tuple[str, str]] = []
+    for sep, text in zip([""] + split[1::2], split[0::2]):
+        if units and not text.strip():
+            units[-1] = (units[-1][0], units[-1][1] + sep + text)  # trailing whitespace: keep it, don't send it alone
+        elif units and not units[-1][1].strip():
+            units[-1] = (units[-1][0], units[-1][1] + sep + text)
+        else:
+            units.append((sep, text))
     out: list[tuple[str, str]] = []
-    for piece, sep in pieces:
-        sub = _split_long(piece, max_chars) if separator == "\n" and len(piece) > max_chars else [(piece, "")]
-        out.append((sub[0][0], sep if out else ""))
+    for piece, sep in _pack(units, max_chars):
+        # A single line can still be too long; split it by sentences.
+        sub = _split_long(piece, max_chars, by_line=False) if by_line else [(piece, "")]
+        out.append((sub[0][0], sep))
         out.extend(sub[1:])
     return out
 
 
 def section_parts(markdown: str, max_chars: int) -> list[tuple[str, str]]:
-    """(section, separator before it) pairs; "".join(sep + section) rebuilds the text."""
+    """(section, separator before it) pairs; "".join(sep + section) rebuilds the text, apart
+    from any trailing whitespace (format_markdown keeps that)."""
+    split = re.split(r"(\n[ \t]*\n\s*)", markdown)
+    paragraphs: list[tuple[str, str]] = []  # (separator before, paragraph)
+    sep = ""
+    for index, piece in enumerate(split):
+        if index % 2 or not piece.strip():
+            sep += piece  # blank lines, or a whitespace-only "paragraph", stay in the separator
+            continue
+        paragraphs.append((sep, piece))
+        sep = ""
     parts: list[tuple[str, str]] = []
-    current: list[str] = []
-    size = 0
+    group: list[tuple[str, str]] = []
 
     def flush() -> None:
-        if current:
-            parts.append(("\n\n".join(current), "\n\n" if parts else ""))
+        parts.extend(_pack(group, max_chars))
+        group.clear()
 
-    for para in (p for p in markdown.split("\n\n") if p.strip()):
+    for sep, para in paragraphs:
         if len(para) > max_chars:
             flush()
-            current, size = [], 0
-            for piece, sep in _split_long(para, max_chars):
-                parts.append((piece, (sep or "\n\n") if parts else ""))
+            for i, (piece, piece_sep) in enumerate(_split_long(para, max_chars)):
+                parts.append((piece, sep if i == 0 else piece_sep))
             continue
-        if current and size + len(para) > max_chars:
-            flush()
-            current, size = [], 0
-        current.append(para)
-        size += len(para) + 2
+        group.append((sep, para))
     flush()
     return parts
 
@@ -630,6 +686,16 @@ def _format_section(
     return section  # the deterministic cleanup, until the user decides
 
 
+def _with_edges_of(section: str, formatted: str) -> str:
+    """`formatted` with the leading and trailing whitespace of `section`, which the model's
+    reply loses (it is stripped), so the page is rebuilt with its original spacing."""
+    stripped = section.strip()
+    if not stripped:
+        return section
+    start = section.index(stripped)
+    return section[:start] + formatted.strip() + section[start + len(stripped):]
+
+
 def format_markdown(
     text: str,
     *,
@@ -677,7 +743,9 @@ def format_markdown(
             result.failed.append(FailedSection(index=index, reason="kept as cleaned text", attempts=0))
             out.append(section)
             continue
-        out.append(_format_section(section, index, total, chosen, client, config, cache, force, result, hooks))
+        formatted = _format_section(section, index, total, chosen, client, config, cache, force, result, hooks)
+        out.append(_with_edges_of(section, formatted))
     hooks.progress(total, total, 0)
-    result.markdown = "".join(sep + section for (_, sep), section in zip(parts, out))
+    rebuilt = "".join(sep + section for section, sep in parts)
+    result.markdown = "".join(sep + section for (_, sep), section in zip(parts, out)) + text[len(rebuilt):]
     return result

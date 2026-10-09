@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 # Bump whenever the cleanup output changes: stored pages made by an older version are
 # rebuilt (pages + search chunks) the next time their book is opened in the reader.
-FORMATTER_VERSION = 4
+FORMATTER_VERSION = 5
 
 MARGIN_FRACTION = 0.08  # top/bottom band of the page where headers/footers live
 REPEAT_FRACTION = 0.3  # a margin line on >= this share of pages is boilerplate
@@ -32,7 +32,12 @@ EDGE_CLIP = 25.0  # points: lines starting this close to the right page edge are
 LIGATURES = {"\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st"}
 BULLET_RE = re.compile(r"^\s*([\u2022\u25e6\u25aa\u25cf\u2023\u2043\u2219\u00b7*\-\u2013])\s+")
 NUMBERED_RE = re.compile(r"^\s*(\d{1,3}[.)])\s+")
-PAGE_NUMBER_RE = re.compile(r"^(page\s*)?\d{1,4}$|^[ivxlcdm]{1,6}$", re.IGNORECASE)
+# A margin page number: "12", "Page 12", or a lowercase roman numeral ("iv", front matter).
+# Only well-formed numerals, and never uppercase: "MIMIC", "DM" or "I" in a margin is text.
+PAGE_NUMBER_RE = re.compile(r"^(?:[Pp]age\s*)?\d{1,4}$|^(?=[ivxlcdm])m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$")
+# Markers that also start ordinary sentences ("- and then", "15. While..."): a list item only
+# where a new item can begin (see _starts_item). Real bullet glyphs (•, ◦, ...) always are.
+AMBIGUOUS_MARKERS = {"*", "-", "\u2013"}
 ABILITIES = ("STR", "DEX", "CON", "INT", "WIS", "CHA")
 ABILITY_TOKEN_RE = re.compile(r"\b(STR|DEX|CON|INT|WIS|CHA)\b|(\d{1,2}\s*\([+\-\u2212\u2013]?\d{1,2}\))")
 
@@ -319,6 +324,8 @@ def join_lines(lines: list[str], keep_hyphen: set[str] | frozenset[str] = frozen
             continue
         if not out:
             out = line
+        elif re.search(r"[^\W\d_]-$", out) and (line[:1].isupper() or line[:1].isdigit()):
+            out = out + line  # "Half-" / "Orc", "pre-" / "1990": a compound, never "Half- Orc"
         elif re.search(r"[A-Za-z]-$", out) and line[:1].islower():
             head = re.search(r"([A-Za-z]+)-$", out).group(1)
             tail = re.match(r"[A-Za-z]+", line)
@@ -374,6 +381,7 @@ def render_page(
         pending: list[Line] = []  # body lines of the current paragraph
         item: list[Line] | None = None  # lines of the current list item
         item_marker = "-"
+        previous_heading: int | None = None  # level of the heading on the line just before, in this block
 
         def flush() -> None:
             nonlocal item
@@ -388,14 +396,19 @@ def render_page(
             level = _heading_level(line, body_size, common)
             bullet = BULLET_RE.match(line.text)
             numbered = NUMBERED_RE.match(line.text)
+            if (numbered or (bullet and bullet.group(1) in AMBIGUOUS_MARKERS)) and not _starts_item(pending, item):
+                bullet = numbered = None  # "15. While wearing it..." continues the sentence before it
             if level:
                 flush()
-                heading = re.sub(r"\s+", " ", line.text)
-                if parts and parts[-1].startswith("#" * level + " ") and not parts[-1].startswith("#" * (level + 1)):
-                    parts[-1] += " " + heading  # heading wrapped onto a second line
+                heading = _escape(re.sub(r"\s+", " ", line.text))
+                if previous_heading == level and level <= 3:
+                    parts[-1] += " " + heading  # a large heading wrapped onto a second line
                 else:
                     parts.append(f"{'#' * level} {heading}")
-            elif bullet or numbered:
+                previous_heading = level
+                continue
+            previous_heading = None
+            if bullet or numbered:
                 flush()
                 marker = bullet or numbered
                 item_marker = "-" if bullet else re.sub(r"\)$", ".", marker.group(1))
@@ -408,6 +421,14 @@ def render_page(
                 pending.append(line)
         flush()
     return "\n\n".join(p for p in _ability_tables(parts) if p.strip())
+
+
+def _starts_item(pending: list[Line], item: list[Line] | None) -> bool:
+    """Whether a line here can begin a list item: at the start of a block, right after another
+    item, or after a line that ends a sentence. Otherwise it's a wrapped line of prose."""
+    if item is not None or not pending:
+        return True
+    return pending[-1].text.rstrip().endswith((".", ":", ";", "!", "?"))
 
 
 def _ability_pairs(part: str) -> list[tuple[str, str]] | None:
@@ -448,7 +469,10 @@ def _ability_tables(parts: list[str]) -> list[str]:
             run.extend(pairs)
         else:
             flush()
-            out.append(part)
+            if pairs:
+                run.extend(pairs)  # the next stat block's scores start a new table
+            else:
+                out.append(part)
     flush()
     return out
 
@@ -470,8 +494,12 @@ def markdown_to_plain(md: str) -> str:
     text = re.sub(r"^#{1,6}\s+", "", md, flags=re.MULTILINE)
     text = re.sub(r"^\s*(?:[-*+]|\d{1,3}\.)\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\|?[\s:|-]+\|[\s:|-]*$", "", text, flags=re.MULTILINE)  # table rules
+    text = re.sub(r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "", text, flags=re.MULTILINE)  # section breaks
+    text = re.sub(r"^[ \t]*(?:>[ \t]?)+", "", text, flags=re.MULTILINE)  # quotes
     text = text.replace("**", "").replace("|", " ")
-    return re.sub(r"\\([\\*_`#|])", r"\1", text)
+    text = re.sub(r"(?<![\\*])\*(?=\S)(.+?)(?<=[^\s\\])\*", r"\1", text)  # *emphasis*
+    text = re.sub(r"(?<![\w\\])_(?=\S)(.+?)(?<=\S)_(?!\w)", r"\1", text)  # _emphasis_
+    return re.sub(r"\\([\\*_`#|>])", r"\1", text)
 
 
 def first_heading(md: str) -> str | None:
