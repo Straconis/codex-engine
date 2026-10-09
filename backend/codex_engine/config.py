@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 APP_NAME = "Codex Engine"
-APP_VERSION = "0.3.9"
+APP_VERSION = "0.3.10"
 GITHUB_OWNER = "Straconis"
 GITHUB_REPO = "codex-engine"
 INSTALLER_NAME_PREFIX = "CodexEngineSetup-"

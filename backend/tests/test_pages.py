@@ -219,9 +219,61 @@ def test_manual_edit_wins_and_can_be_reverted(api, tmp_path):
 
 def test_manual_edit_survives_a_formatter_upgrade(conn):
     sid = db.create_source_with_chunks(conn, "B", "/b.pdf", "h", 1, [], page_rows=pages_of("old", version=0))
-    db.set_page_edit(conn, sid, 1, "## Hand-fixed")
+    db.set_page_edit(conn, sid, 1, "## Hand-fixed", [])
     db.rebuild_source_content(conn, sid, pages_of("new clean"), [])
     assert db.get_page(conn, sid, 1).edited_md == "## Hand-fixed"
+
+
+def search_pages(client, query):
+    return [r["page_num"] for r in client.get("/api/search", params={"query": query}).json()]
+
+
+def test_manual_edits_are_searchable_and_revert_restores_the_cleaned_text(api, tmp_path):
+    client, app_module, _ = api
+    pdf = tmp_path / "b.pdf"
+    make_pdf(pdf, "The wyvern nests in the cliffs.", "Second page.")
+    sid = add_source(app_module, pdf, "x", "y", with_pages=False)
+    client.get(f"/api/sources/{sid}/pages/1")  # builds pages and search chunks
+    assert search_pages(client, "wyvern") == [1]
+
+    client.put(f"/api/sources/{sid}/pages/1/edit", json={"markdown": "## Basilisk\nIts gaze turns flesh to stone."}, headers=HEADERS)
+    assert search_pages(client, "basilisk") == [1] and search_pages(client, "wyvern") == []
+    assert search_pages(client, "second") == [2]  # other pages untouched
+
+    client.delete(f"/api/sources/{sid}/pages/1/edit", headers=HEADERS)
+    assert search_pages(client, "wyvern") == [1] and search_pages(client, "basilisk") == []
+
+
+def test_search_keeps_finding_edits_after_a_formatter_upgrade(api, tmp_path):
+    client, app_module, _ = api
+    pdf = tmp_path / "b.pdf"
+    make_pdf(pdf, "The wyvern nests in the cliffs.")
+    sid = add_source(app_module, pdf, "x", with_pages=False)
+    client.put(f"/api/sources/{sid}/pages/1/edit", json={"markdown": "The basilisk nests here."}, headers=HEADERS)
+    conn = app_module._conn()
+    conn.execute("UPDATE pages SET clean_version=0 WHERE source_id=?", (sid,))
+    conn.commit()
+    conn.close()
+
+    assert client.get(f"/api/sources/{sid}/pages/1").json()["edited_md"] == "The basilisk nests here."  # rebuilt
+    assert search_pages(client, "basilisk") == [1] and search_pages(client, "wyvern") == []
+
+
+def test_edits_saved_before_0_3_10_are_indexed_once_on_upgrade(api, tmp_path):
+    client, app_module, _ = api
+    sid = add_source(app_module, tmp_path / "b.pdf", "The wyvern nests in the cliffs.")
+    conn = app_module._conn()
+    conn.execute("INSERT INTO chunks (source_id, page_num, heading, body, loc) VALUES (?,1,NULL,'The wyvern nests in the cliffs.','p. 1')", (sid,))
+    conn.execute("UPDATE pages SET edited_md='The basilisk nests here.' WHERE source_id=?", (sid,))  # old-style edit
+    conn.execute("PRAGMA user_version = 0")
+    conn.commit()
+    conn.close()
+
+    app_module._schema_ready = False  # next start
+    assert search_pages(client, "basilisk") == [1] and search_pages(client, "wyvern") == []
+    conn = app_module._conn()
+    assert db.schema_step(conn) == db.EDITS_INDEXED
+    conn.close()
 
 
 def test_ollama_unavailable_is_503_not_500(api, tmp_path, monkeypatch):

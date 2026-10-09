@@ -20,7 +20,7 @@ from . import ai_format, db
 from .config import APP_VERSION
 from .events import EventBroker
 from .formatting import FORMATTER_VERSION
-from .ingest import IngestManager, rebuild_source
+from .ingest import IngestManager, index_saved_edits, page_chunks, rebuild_source
 from .models import AIFormatArgs, EditPageArgs, OpenPdfArgs, PullModelArgs, ResolveDuplicateArgs, StartIngestArgs
 from .ollama_manager import OllamaManager
 from .platforming import app_data_dir, database_path, open_file_at_page
@@ -92,6 +92,8 @@ def _conn():
         with _schema_lock:
             if not _schema_ready:
                 db.init_schema(conn)
+                if db.schema_step(conn) < db.EDITS_INDEXED:
+                    index_saved_edits(conn)
                 _schema_ready = True
     return conn
 
@@ -512,7 +514,7 @@ def save_page_edit(source_id: int, page_num: int, args: EditPageArgs):
     conn = _conn()
     try:
         source, _ = _load_page(conn, source_id, page_num)
-        db.set_page_edit(conn, source_id, page_num, args.markdown)
+        db.set_page_edit(conn, source_id, page_num, args.markdown, page_chunks(page_num, args.markdown))
         return _page_response(source, db.get_page(conn, source_id, page_num))
     finally:
         conn.close()
@@ -522,8 +524,8 @@ def save_page_edit(source_id: int, page_num: int, args: EditPageArgs):
 def revert_page_edit(source_id: int, page_num: int):
     conn = _conn()
     try:
-        source, _ = _load_page(conn, source_id, page_num)
-        db.set_page_edit(conn, source_id, page_num, None)
+        source, page = _load_page(conn, source_id, page_num)
+        db.set_page_edit(conn, source_id, page_num, None, page_chunks(page_num, page.clean_md or ""))
         return _page_response(source, db.get_page(conn, source_id, page_num))
     finally:
         conn.close()
