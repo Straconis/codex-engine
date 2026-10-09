@@ -141,14 +141,13 @@ def download_installer(update: dict) -> str:
     request = urllib.request.Request(installer_url, headers={"User-Agent": "Codex-Engine-Updater"})
     written = 0
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            with partial_path.open("wb") as output_file:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    output_file.write(chunk)
-                    written += len(chunk)
+        with urllib.request.urlopen(request, timeout=120) as response, partial_path.open("wb") as output_file:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output_file.write(chunk)
+                written += len(chunk)
         # A dropped connection can end the read loop "successfully" with a truncated
         # file; never hand a truncated installer to the updater.
         if isinstance(expected_size, int) and expected_size > 0 and written != expected_size:

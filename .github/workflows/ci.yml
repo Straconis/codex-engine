@@ -5,10 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   version:
     name: Version and release notes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - run: node scripts/check-version.mjs
@@ -16,6 +25,7 @@ jobs:
   backend:
     name: Backend tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -31,11 +41,15 @@ jobs:
             backend/requirements.txt
             backend/requirements-dev.txt
       - run: python -m pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - name: Lint (ruff)
+        if: runner.os == 'Linux'
+        run: ruff check backend
       - run: python -m pytest backend/tests -q
 
   frontend:
-    name: Frontend typecheck and build
+    name: Frontend lint, typecheck and build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,4 +59,36 @@ jobs:
       - run: npm ci
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      - run: npm run lint
       - run: npm run build
+
+  windows-packaging:
+    name: Windows build scripts and installer script
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem scripts -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+      - name: Installer script compiles
+        shell: pwsh
+        run: |
+          # A stand-in for the packaged app: this checks the .iss (including its code), not the app.
+          $app = "release\electron\win-unpacked"
+          New-Item -ItemType Directory -Force "$app\resources", "$app\locales" | Out-Null
+          Set-Content "$app\Codex Engine.exe" "placeholder"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y | Out-Null
+          }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          & $iscc "/DMyAppVersion=$version" installer\codex-engine.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }

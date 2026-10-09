@@ -6,14 +6,19 @@ import type { ReactNode } from "react";
 const MATCH_START = "\u0002";
 const MATCH_END = "\u0003";
 
+// Length of a snippet as shown, without the match markers.
+function visibleLength(text: string): number {
+  return text.replaceAll(MATCH_START, "").replaceAll(MATCH_END, "").length;
+}
+
 /** Snippet text with matched terms as <mark>, trimmed to ~max chars around the first match. */
 export function markedSnippet(snippet: string, max = 280): ReactNode[] {
   let text = (snippet ?? "").replace(/\s+/g, " ").trim();
   const first = text.indexOf(MATCH_START);
-  if (text.replace(/[\u0002\u0003]/g, "").length > max && first > max / 2) {
+  if (visibleLength(text) > max && first > max / 2) {
     text = "…" + text.slice(first - Math.floor(max / 3));
   }
-  if (text.replace(/[\u0002\u0003]/g, "").length > max) {
+  if (visibleLength(text) > max) {
     // Cut on plain-text length, keeping marker pairs balanced.
     let visible = 0;
     let cut = text.length;
@@ -53,7 +58,8 @@ export function queryPattern(query: string): RegExp | null {
     const words = phrase.match(/[\p{L}\p{N}]+/gu);
     if (!words) continue;
     // Words of a term may be separated by any punctuation/space, like the search tokenizer.
-    const body = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\\p{L}\\p{N}]+");
+    // (Words are letters and digits only, so they need no regex escaping.)
+    const body = words.join("[^\\p{L}\\p{N}]+");
     terms.push(`(?<![\\p{L}\\p{N}])${body}${prefix ? "[\\p{L}\\p{N}]*" : "(?![\\p{L}\\p{N}])"}`);
   }
   return terms.length ? new RegExp(terms.join("|"), "giu") : null;

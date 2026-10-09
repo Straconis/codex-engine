@@ -24,8 +24,9 @@ import re
 import unicodedata
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Protocol
 
 # Bump when SYSTEM_PROMPT changes meaningfully, so cached output from the old prompt isn't reused.
 PROMPT_VERSION = 3
@@ -80,7 +81,7 @@ class AIConfig:
     retry_temperature: float = 0.3  # a little variation on retries, so a retry isn't the same answer
 
     @classmethod
-    def from_env(cls) -> "AIConfig":
+    def from_env(cls) -> AIConfig:
         env = os.environ.get
         default = cls()
         return cls(
@@ -380,7 +381,10 @@ def describe_changes(source: str, output: str) -> dict:
     invisible characters and spacing, i.e. the page was already well formatted.
     """
     invisible = len(INVISIBLE_RE.findall(source)) - len(INVISIBLE_RE.findall(output))
-    squash = lambda t: re.sub(r"[ \t]+", " ", re.sub(r"[ \t]+\n", "\n", INVISIBLE_RE.sub("", t))).strip()
+
+    def squash(t: str) -> str:
+        return re.sub(r"[ \t]+", " ", re.sub(r"[ \t]+\n", "\n", INVISIBLE_RE.sub("", t))).strip()
+
     meaningful = squash(source) != squash(output)
     markup = 0
     line_breaks = 0

@@ -26,8 +26,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from . import ai_format
 from .settings import AppSettings, SettingsStore
@@ -51,7 +51,7 @@ def default_ollama_locations() -> list[Path]:
     home = Path.home()
     if sys.platform.startswith("win"):
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        program_files = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))  # Windows env names ignore case
         return [local / "Programs" / "Ollama" / "ollama.exe", program_files / "Ollama" / "ollama.exe"]
     if sys.platform == "darwin":
         return [Path("/Applications/Ollama.app/Contents/Resources/ollama"), Path("/usr/local/bin/ollama"), Path("/opt/homebrew/bin/ollama")]
@@ -292,7 +292,7 @@ class OllamaManager:
                 return
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        log = open(self.log_dir / "ollama.log", "ab")
+        log = open(self.log_dir / "ollama.log", "ab")  # noqa: SIM115  # handed to the process; closed below
         kwargs: dict = {"stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "env": env}
         if sys.platform.startswith("win"):
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

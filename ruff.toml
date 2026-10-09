@@ -1,0 +1,21 @@
+# Python lint settings. CI runs `ruff check backend`.
+target-version = "py312"
+line-length = 160
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+  "E501",    # long lines: strings and regexes are clearer unwrapped
+  "RUF001", "RUF002", "RUF003",  # the text cleanup works with look-alike characters on purpose
+  "SIM108",  # a ternary isn't always clearer
+  "B905",    # zip() over lists of equal length by construction
+  "RUF005", "RUF007",  # style only
+]
+
+[lint.flake8-bugbear]
+# FastAPI declares request bodies and uploads this way.
+extend-immutable-calls = ["fastapi.Body", "fastapi.File", "fastapi.Header", "fastapi.Query"]
+
+[lint.per-file-ignores]
+# flush() is defined per block and only called within that block's loop.
+"backend/codex_engine/formatting.py" = ["B023"]

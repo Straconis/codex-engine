@@ -4,17 +4,17 @@ import ntpath
 import os
 import platform
 import subprocess
-import sys
 from pathlib import Path
 
 from platformdirs import user_data_dir
 
 APP_NAME = "Codex Engine"
-APP_AUTHOR = False
+# No author folder: data lives in %LOCALAPPDATA%\Codex Engine, not %LOCALAPPDATA%\<author>\Codex Engine.
+NO_APP_AUTHOR = False
 
 
 def app_data_dir() -> Path:
-    path = Path(user_data_dir(APP_NAME, APP_AUTHOR))
+    path = Path(user_data_dir(APP_NAME, NO_APP_AUTHOR))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -91,7 +91,4 @@ def open_file_at_page(path: str, page: int) -> None:
     opener = os.environ.get("BROWSER") or "xdg-open"
     subprocess.Popen([opener, uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-
-def is_windows() -> bool:
-    return sys.platform.startswith("win")
 

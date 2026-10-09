@@ -1,15 +1,6 @@
-# Rust
-/target
-**/*.rs.bk
-
 # Node
-node_modules
-dist
-
-# Tauri
-src-tauri/target
-src-tauri/gen
-src-tauri/*.log
+node_modules/
+/dist/
 
 # OS
 .DS_Store
@@ -22,15 +13,21 @@ Thumbs.db
 *.sqlite3
 *.db
 
-# IDE
-.vscode
-.idea
+# Local settings and editors (shared editor settings can go in .vscode/ deliberately)
+.env
+.env.*
+.vscode/*
+!.vscode/extensions.json
+.idea/
 
-# Python backend runtime
-backend/.venv/
-backend/uploads/
+# Python
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+backend/uploads/
 
 # Generated release/build artifacts
 /release/
@@ -39,3 +36,4 @@ __pycache__/
 /backend/build/
 /backend/dist/
 /backend/*.spec
+*.tsbuildinfo

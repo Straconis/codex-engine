@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from codex_engine.formatting import (
     Line,
     PageLayout,
@@ -174,7 +173,7 @@ def test_unique_chapter_title_at_top_of_page_is_kept():
     assert format_document(pages)[0].startswith("# Chapter One: The Road")
 
 
-def test_hyphen_kept_when_next_line_starts_uppercase_or_digit():
+def test_hyphen_kept_before_a_digit_and_removed_inside_a_word():
     assert join_lines(["See pre-", "1990 rules"]) == "See pre-1990 rules"
     assert join_lines(["imag-", "ination"]) == "imagination"
 
@@ -234,7 +233,9 @@ def test_lines_hanging_off_the_page_edge_are_dropped():
         def get_text(self, kind, flags=0):
             if kind == "text":
                 return "raw"
-            line = lambda text, x0, x1: {"bbox": (x0, 100, x1, 110), "spans": [{"text": text, "size": 9, "flags": 0, "font": "Georgia"}]}
+            def line(text, x0, x1):
+                return {"bbox": (x0, 100, x1, 110), "spans": [{"text": text, "size": 9, "flags": 0, "font": "Georgia"}]}
+
             return {"width": 612.0, "height": 792.0, "blocks": [
                 {"type": 0, "lines": [line("Real text in the column.", 320, 560)]},
                 {"type": 0, "lines": [line("When", 592.2, 612), line("an up", 592.2, 612)]},  # clipped overflow
@@ -243,7 +244,7 @@ def test_lines_hanging_off_the_page_edge_are_dropped():
     from codex_engine.formatting import layout_from_pymupdf
 
     layout = layout_from_pymupdf(FakePage())
-    assert [l.text for b in layout.blocks for l in b] == ["Real text in the column."]
+    assert [ln.text for b in layout.blocks for ln in b] == ["Real text in the column."]
 
 
 def test_common_larger_stat_font_is_not_a_heading_and_labels_are_bold():

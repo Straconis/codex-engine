@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 
 import pytest
-
 from codex_engine import ai_format
 from codex_engine.ai_format import AIConfig, AIFormatError, AIUnavailable, check_faithful, describe_changes, format_markdown
 
@@ -88,7 +87,7 @@ def test_destructive_output_is_rejected(bad, reason):
 
 def test_changing_a_single_word_in_a_long_section_is_rejected():
     src = " ".join([PROSE] * 4) + " The guard swore a damned oath and spat."
-    with pytest.raises(AIFormatError, match="changed words .*damned"):
+    with pytest.raises(AIFormatError, match=r"changed words .*damned"):
         check_faithful(src, src.replace("damned", "darned"))
     with pytest.raises(AIFormatError, match="changed words"):
         check_faithful(src, src.replace("torrents", "torrent", 1))  # "modernised"/corrected
@@ -131,12 +130,12 @@ def test_number_lines_are_kept_wherever_they_are():
     # A roll table: each entry's number sits on its own line, like a page number would.
     table = "\n".join(f"{n}\nThe party meets a wandering merchant with strange wares." for n in range(1, 7))
     src = FOREST_INTRO + "\n" + table + "\n" + FOREST_INTRO
-    with pytest.raises(AIFormatError, match="dropped text .*'3'"):
+    with pytest.raises(AIFormatError, match=r"dropped text .*'3'"):
         check_faithful(src, src.replace("\n3\n", "\n"))
     # The end of a section is not the end of a page: a stat there must stay (0.3.10 let it go).
-    with pytest.raises(AIFormatError, match="dropped text .*'15'"):
+    with pytest.raises(AIFormatError, match=r"dropped text .*'15'"):
         check_faithful(FOREST_INTRO + "\nArmor Class\n15", FOREST_INTRO + "\nArmor Class")
-    with pytest.raises(AIFormatError, match="dropped text .*'1 2 3'"):
+    with pytest.raises(AIFormatError, match=r"dropped text .*'1 2 3'"):
         check_faithful("1 2 3\n" + FOREST_INTRO, FOREST_INTRO)
 
 
@@ -187,12 +186,12 @@ def test_words_split_across_lines_may_be_rejoined():
 
 def test_dropping_a_short_stat_block_line_is_rejected():
     bad = STAT_BLOCK.replace("**Senses** darkvision 60 ft., passive Perception 8\n\n", "")
-    with pytest.raises(AIFormatError, match="dropped text .*Senses darkvision"):
+    with pytest.raises(AIFormatError, match=r"dropped text .*Senses darkvision"):
         check_faithful(STAT_BLOCK, bad)
 
 
 def test_changing_capitalisation_is_rejected():
-    with pytest.raises(AIFormatError, match="changed words .*OGRE"):
+    with pytest.raises(AIFormatError, match=r"changed words .*OGRE"):
         check_faithful(STAT_BLOCK, STAT_BLOCK.replace("OGRE BOLT LAUNCHER", "Ogre Bolt Launcher"))
     check_faithful(STAT_BLOCK, STAT_BLOCK.replace("### OGRE BOLT LAUNCHER", "## OGRE BOLT LAUNCHER"))  # layout only
 

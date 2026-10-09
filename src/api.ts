@@ -1,11 +1,13 @@
+// Response types list the fields the UI reads (the backend may send more). A field is optional
+// only when the backend can leave it out.
+
 export type SourceRow = {
   id: number;
   title: string;
   path: string;
   sha256: string;
   pages: number;
-  enabled: number;
-  source_key?: string;
+  enabled: boolean; // false: turned off, not searched
 };
 
 export type SearchRow = {
@@ -15,7 +17,6 @@ export type SearchRow = {
   page_num: number;
   heading: string | null;
   snippet: string;
-  loc: string | null;
 };
 
 export type PageVersion = "edited" | "ai" | "clean" | "raw";
@@ -25,10 +26,6 @@ export type ReaderView = PageVersion | "changes";
 // What an accepted AI run changed (returned by ai-format).
 export type AIChanges = {
   meaningful: boolean; // false: only invisible characters/spacing differed (already well formatted)
-  lines_changed: number;
-  markup: number;
-  line_breaks: number;
-  invisible_removed: number;
   summary: string;
 };
 
@@ -57,18 +54,16 @@ export type PageView = {
   path: string;
   raw_text: string | null;
   clean_md: string;
-  clean_version: number;
   ai_md: string | null;
   ai_model: string | null;
   ai_error: string | null; // last AI attempt's rejection/partial note; cleaned text is used instead
-  ai_updated_at: string | null;
   ai_stale: boolean; // ai_md was made from an older cleanup of this page, or fails the current check
-  ai_check_failed?: boolean; // ai_md fails the current (stricter) faithfulness check
+  ai_check_failed: boolean; // ai_md fails the current (stricter) faithfulness check
   edited_md: string | null; // the user's own correction; shown before anything else
   ai_changes?: AIChanges | null; // only on an ai-format response that saved a new AI version
   edited_at: string | null;
   best: PageVersion; // what the reader should show by default
-  pending?: AIPending | null; // set when the user must decide what to do with failed sections
+  pending: AIPending | null; // set when the user must decide what to do with failed sections
 };
 
 export type ModelPull = {
@@ -86,11 +81,8 @@ export type AIStatus = {
   model: string | null;
   error: string | null;
   state: "idle" | "starting" | "running" | "external" | "off" | "not_installed" | "error";
-  mode: "managed" | "external" | "off";
-  url: string;
   models_dir: string;
   ollama_path: string;
-  pull: ModelPull | null;
 };
 
 // Per-machine settings (stored in the app data folder on each computer).
@@ -111,37 +103,46 @@ export type IngestProgress = {
   current: number;
   total: number;
   done: boolean;
-  error?: string | null;
+  error: string | null;
 };
 
+// Server-sent events (see api.eventsUrl), besides ingest_progress, model_pull and ai_status.
 export type DuplicateDetectedPayload = {
   ingest_id: number;
   new_path: string;
-  new_title?: string;
-  sha256?: string;
+  new_title: string;
   existing_id: number;
   existing_title: string;
   existing_path: string;
 };
 
+// Live progress of an AI format run: part `done` of `total`, and how much of the current
+// part's reply has been `written` of the `expected` length.
+export type AIFormatProgressEvent = {
+  source_id: number;
+  page_num: number;
+  done: number;
+  total: number;
+  attempt: number;
+  max_attempts: number;
+  written: number;
+  expected: number;
+};
+
+// One plain-language step of an AI format run; `at` is in seconds since the epoch.
+export type AIFormatLogEvent = { source_id: number; page_num: number; message: string; at: number };
+
 export type VersionInfo = {
-  app: string;
-  frontend_version: string;
   backend_version: string;
   updater_version: string;
   platform: string;
   updater_present: boolean;
-  updater_path?: string | null;
 };
 
 export type UpdateCheckResult = {
   status: "current" | "update_available" | "missing_installer" | "updater_launched" | "no_release";
   current_version: string;
   latest_version: string;
-  release_url?: string | null;
-  installer_name?: string | null;
-  installer_url?: string | null;
-  installer_path?: string | null;
   platform?: string | null;
   expected_asset?: string | null;
   message?: string | null;
@@ -186,7 +187,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof detail === "string" && detail) message = detail;
       // FastAPI validation errors (422): a list of { loc, msg, type }.
       else if (Array.isArray(detail) && detail.length)
-        message = detail.map((d: any) => (typeof d?.msg === "string" ? d.msg : JSON.stringify(d))).join("; ");
+        message = detail.map((d: { msg?: unknown }) => (typeof d?.msg === "string" ? d.msg : JSON.stringify(d))).join("; ");
       else if (detail != null && typeof detail !== "string") message = JSON.stringify(detail);
     } catch {
       // keep default
@@ -196,9 +197,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+/** A caught error as text for the user: the message without the "Error: " prefix. */
+export function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e).replace(/^Error: /, "");
+}
+
 export const api = {
   eventsUrl: `${API_BASE}/api/events`,
-  getVersion: () => request<Omit<VersionInfo, "frontend_version">>("/api/version"),
+  getVersion: () => request<VersionInfo>("/api/version"),
   listSources: () => request<SourceRow[]>("/api/sources"),
   setSourceEnabled: (sourceId: number, enabled: boolean) =>
     request<{ ok: boolean }>(`/api/sources/${sourceId}/enabled`, {
@@ -234,7 +240,7 @@ export const api = {
     }),
   saveEdit: (sourceId: number, page: number, markdown: string) =>
     request<PageView>(`/api/sources/${sourceId}/pages/${page}/edit`, { method: "PUT", body: JSON.stringify({ markdown }) }),
-  // Stops a running AI format of the page; its request then fails with 409 "Cancelled...".
+  // Stops a running AI format of the page; its request then fails with 409 "Cancelled…".
   cancelAiFormat: (sourceId: number, page: number) =>
     request<{ ok: boolean }>(`/api/sources/${sourceId}/pages/${page}/ai-format/cancel`, { method: "POST" }),
   revertEdit: (sourceId: number, page: number) =>

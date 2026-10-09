@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -26,8 +26,8 @@ from .models import AIFormatArgs, EditPageArgs, OpenPdfArgs, PullModelArgs, Reso
 from .ollama_manager import OLLAMA_SETTINGS, OllamaManager
 from .platforming import app_data_dir, database_path, open_file_at_page
 from .settings import SettingsStore
-from .uploads import store_upload
 from .updater.update_client import can_apply_updates, check_for_update, cleanup_update_files, download_installer, launch_updater
+from .uploads import store_upload
 
 # Every state-changing request must carry this header. A custom header forces a CORS
 # preflight, so random web pages open in the user's browser can't fire "simple"
@@ -87,16 +87,21 @@ _schema_lock = threading.Lock()
 _schema_ready = False
 
 
-def _conn():
+def _conn() -> sqlite3.Connection:
+    """A new database connection. The first one also creates or upgrades the schema."""
     global _schema_ready
     conn = db.open_db(database_path())
     if not _schema_ready:
-        with _schema_lock:
-            if not _schema_ready:
-                db.init_schema(conn)
-                if db.schema_step(conn) < db.EDITS_INDEXED:
-                    index_saved_edits(conn)
-                _schema_ready = True
+        try:
+            with _schema_lock:
+                if not _schema_ready:
+                    db.init_schema(conn)
+                    if db.schema_version(conn) < db.SCHEMA_EDITS_INDEXED:
+                        index_saved_edits(conn)
+                    _schema_ready = True
+        except BaseException:
+            conn.close()
+            raise
     return conn
 
 
@@ -159,7 +164,7 @@ async def events(request: Request):
                     break
                 try:
                     name, payload = await asyncio.wait_for(q.get(), timeout=15)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Keepalive comment; also lets us notice dead clients.
                     yield ": keepalive\n\n"
                     continue
@@ -187,17 +192,17 @@ def shutdown(x_codex_engine_shutdown_token: str | None = Header(default=None)):
 def check_update():
     try:
         return check_for_update()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # GitHub unreachable or answered badly: not the client's fault
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 _update_lock = threading.Lock()
 
 
 @app.post("/api/update/apply")
-def apply_update(payload: dict | None = None):
-    # Never trust an installer URL handed in by the client: re-resolve it from GitHub
-    # here. The payload is accepted only for backwards compatibility and ignored.
+def apply_update():
+    # Never trust an installer URL handed in by the client: it is resolved from GitHub here
+    # (any request body is ignored).
     if not can_apply_updates():
         raise HTTPException(status_code=400, detail="Automatic updates are only available in the Windows app. Download the new version from GitHub.")
     if not _update_lock.acquire(blocking=False):
@@ -210,7 +215,7 @@ def apply_update(payload: dict | None = None):
         launch_updater(installer_path)
         return {**update, "status": "updater_launched", "installer_path": installer_path}
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         _update_lock.release()
 
@@ -239,8 +244,11 @@ def set_source_enabled(source_id: int, args: SetEnabledArgs):
 def delete_source(source_id: int):
     conn = _conn()
     try:
-        if not db.delete_source(conn, source_id):
+        source = db.get_source(conn, source_id)
+        if not source or not db.delete_source(conn, source_id):
             raise HTTPException(status_code=404, detail="Source not found.")
+        # A PDF the app copied into its uploads folder goes too, once no book uses it.
+        ingests.discard_managed_file(conn, Path(source.path))
         return {"ok": True}
     finally:
         conn.close()
@@ -257,29 +265,29 @@ def _ensure_pages_current(conn, source) -> None:
     Books ingested before the reader existed have no pages; books cleaned by an older
     formatter get re-cleaned. If the PDF is gone we keep whatever is stored.
     """
-    version = db.oldest_clean_version(conn, source.id)
-    if version is not None and version >= FORMATTER_VERSION:
+    clean_version = db.oldest_clean_version(conn, source.id)
+    if clean_version is not None and clean_version >= FORMATTER_VERSION:
         return
     with _rebuild_locks_guard:
         lock = _rebuild_locks.setdefault(source.id, threading.Lock())
     with lock:
-        version = db.oldest_clean_version(conn, source.id)  # another request may have finished it
-        if version is not None and version >= FORMATTER_VERSION:
+        clean_version = db.oldest_clean_version(conn, source.id)  # another request may have finished it
+        if clean_version is not None and clean_version >= FORMATTER_VERSION:
             return
         path = Path(source.path)
         if not path.is_file():
-            if version is None:
+            if clean_version is None:
                 raise HTTPException(status_code=404, detail=f"The original PDF is missing, so this page can't be shown: {source.path}")
             return
         attempt = (str(path), path.stat().st_mtime_ns)
-        if _failed_rebuilds.get(source.id) == attempt and version is not None:
+        if _failed_rebuilds.get(source.id) == attempt and clean_version is not None:
             return  # failed on this exact file before; keep the stored pages until it changes
         try:
             rebuild_source(conn, source.id, path)
         except Exception as exc:
             _failed_rebuilds[source.id] = attempt
             print(f"Rebuilding pages of source {source.id} from {path} failed: {exc}", file=sys.stderr)
-            if version is None:
+            if clean_version is None:
                 raise HTTPException(status_code=400, detail=f"Could not read the PDF to build pages: {exc}") from exc
         else:
             _failed_rebuilds.pop(source.id, None)
@@ -566,11 +574,13 @@ def revert_page_edit(source_id: int, page_num: int):
 
 
 @app.get("/api/search")
-def search(query: str):
+def search(query: str = Query(max_length=1000)):
     conn = _conn()
     try:
         return [row.model_dump() for row in db.search(conn, query, 50)]
     except sqlite3.OperationalError as exc:
+        if "locked" in str(exc):
+            raise HTTPException(status_code=503, detail="The library is busy saving a book. Try the search again in a moment.") from exc
         raise HTTPException(status_code=400, detail=f"Search failed: {exc}") from exc
     finally:
         conn.close()
@@ -580,7 +590,9 @@ def search(query: str):
 def start_ingest(args: StartIngestArgs):
     try:
         return {"id": ingests.start(args.path)}
-    except Exception as exc:
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -615,8 +627,6 @@ def resolve_duplicate(args: ResolveDuplicateArgs):
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=exc.args[0]) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/open-pdf")
@@ -624,5 +634,7 @@ def open_pdf(args: OpenPdfArgs):
     try:
         open_file_at_page(args.path, args.page)
         return {"ok": True}
-    except Exception as exc:
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

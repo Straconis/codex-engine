@@ -1,5 +1,7 @@
-import { useEffect, useState } from "react";
-import { api, type AIStatus, type AppSettings, type ModelPull } from "./api";
+import { useCallback, useEffect, useId, useState } from "react";
+import { api, errorText, type AIStatus, type AppSettings, type ModelPull } from "./api";
+import Dialog from "./Dialog";
+import { percent } from "./format";
 
 // Per-machine AI settings. Codex Engine can run Ollama itself, storing models wherever
 // this computer has room (system drive, second drive, companion/external drive).
@@ -52,6 +54,12 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
   const canBrowse = Boolean(window.codexEngine?.pickFolder);
   const dirty = Boolean(saved && draft && JSON.stringify(saved) !== JSON.stringify(draft));
   const pulling = Boolean(pull && !pull.done);
+  const ids = useId(); // prefix for the form controls' ids, so their captions can be <label htmlFor>
+
+  // onStatus is App's state setter, so this stays the same function and the effects below run once.
+  const refreshStatus = useCallback(() => {
+    api.aiStatus().then(onStatus).catch(() => undefined);
+  }, [onStatus]);
 
   useEffect(() => {
     api
@@ -62,13 +70,9 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
         setSettingsPath(path);
         setDownloadName(settings.model);
       })
-      .catch((e: any) => setError(`Couldn't load settings: ${String(e)}`));
+      .catch((e: unknown) => setError(`Couldn't load settings: ${errorText(e)}`));
     refreshStatus();
-  }, []);
-
-  function refreshStatus() {
-    api.aiStatus().then(onStatus).catch(() => undefined);
-  }
+  }, [refreshStatus]);
 
   // Ollama may still be starting when the panel opens (e.g. right after app launch):
   // keep checking until it settles, so the panel never shows a stale "starting".
@@ -77,7 +81,7 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     if (!settling) return;
     const timer = window.setInterval(refreshStatus, 1500);
     return () => window.clearInterval(timer);
-  }, [settling]);
+  }, [settling, refreshStatus]);
 
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     setDraft((d) => (d ? { ...d, [key]: value } : d));
@@ -114,8 +118,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
       }
       onStatus(s);
       return s;
-    } catch (e: any) {
-      setError(String(e).replace(/^Error: /, ""));
+    } catch (e: unknown) {
+      setError(errorText(e));
       return null;
     } finally {
       setSaving(false);
@@ -138,8 +142,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     }
     try {
       await api.pullModel(name);
-    } catch (e: any) {
-      setError(String(e).replace(/^Error: /, ""));
+    } catch (e: unknown) {
+      setError(errorText(e));
     }
   }
 
@@ -149,23 +153,27 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     : !ollamaReady
     ? status?.state === "starting" || status?.state === "idle"
       ? "Waiting for Ollama to start…"
-      : "Ollama isn't running, see the status above."
+      : "Ollama isn't running. See the status above."
     : "";
 
   const installed = status?.models ?? [];
   const modelOptions = draft && !installed.includes(draft.model) ? [draft.model, ...installed] : installed;
-  const pct = pull && pull.total ? Math.min(100, Math.round((pull.completed / pull.total) * 100)) : 0;
+  const pct = pull ? (pull.done && !pull.error ? 100 : percent(pull.completed, pull.total)) : 0;
 
   return (
-    <div className="overlay" onMouseDown={onClose}>
-      <div className="modal settings" onMouseDown={(e) => e.stopPropagation()}>
+    <Dialog
+      className="settings"
+      onClose={onClose}
+      closeOnBackdrop
+      header={(titleId) => (
         <div className="modalHeader">
-          <h3>Settings</h3>
+          <h3 id={titleId}>Settings</h3>
           <button className="btn small" onClick={onClose}>
             Close
           </button>
         </div>
-
+      )}
+    >
         <div className="modalBody settingsBody">
           <div className={`aiState state-${status?.state ?? "idle"}`}>
             <b>AI formatting: {status ? STATE_TEXT[status.state] : "Checking…"}</b>
@@ -191,20 +199,21 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
               <fieldset className="settingsGroup" disabled={!draft.ai_enabled}>
                 <legend>Ollama</legend>
                 <label className="radio">
-                  <input type="radio" checked={draft.manage_ollama} onChange={() => set("manage_ollama", true)} />
+                  <input type="radio" name={`${ids}-ollama`} checked={draft.manage_ollama} onChange={() => set("manage_ollama", true)} />
                   Codex Engine runs Ollama for me (recommended)
                 </label>
                 <label className="radio">
-                  <input type="radio" checked={!draft.manage_ollama} onChange={() => set("manage_ollama", false)} />
+                  <input type="radio" name={`${ids}-ollama`} checked={!draft.manage_ollama} onChange={() => set("manage_ollama", false)} />
                   I run Ollama myself
                 </label>
 
                 {draft.manage_ollama ? (
                   <>
                     <div className="field">
-                      <span>Model storage folder</span>
+                      <label htmlFor={`${ids}-models-dir`}>Model storage folder</label>
                       <div className="row">
                         <input
+                          id={`${ids}-models-dir`}
                           className="input"
                           value={draft.models_dir}
                           onChange={(e) => set("models_dir", e.target.value)}
@@ -222,9 +231,10 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                       </div>
                     </div>
                     <div className="field">
-                      <span>Ollama program</span>
+                      <label htmlFor={`${ids}-ollama-path`}>Ollama program</label>
                       <div className="row">
                         <input
+                          id={`${ids}-ollama-path`}
                           className="input"
                           value={draft.ollama_path}
                           onChange={(e) => set("ollama_path", e.target.value)}
@@ -241,8 +251,9 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                       )}
                     </div>
                     <div className="field narrow">
-                      <span>Port</span>
+                      <label htmlFor={`${ids}-port`}>Port</label>
                       <input
+                        id={`${ids}-port`}
                         className="input"
                         type="number"
                         min={1024}
@@ -254,8 +265,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                   </>
                 ) : (
                   <div className="field">
-                    <span>Ollama address</span>
-                    <input className="input" value={draft.external_url} onChange={(e) => set("external_url", e.target.value)} />
+                    <label htmlFor={`${ids}-url`}>Ollama address</label>
+                    <input id={`${ids}-url`} className="input" value={draft.external_url} onChange={(e) => set("external_url", e.target.value)} />
                     <div className="hint">Usually http://127.0.0.1:11434. Can be another computer on your network.</div>
                   </div>
                 )}
@@ -264,8 +275,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
               <fieldset className="settingsGroup" disabled={!draft.ai_enabled}>
                 <legend>Model</legend>
                 <div className="field">
-                  <span>Use this model for formatting</span>
-                  <select className="input" value={draft.model} onChange={(e) => set("model", e.target.value)}>
+                  <label htmlFor={`${ids}-model`}>Use this model for formatting</label>
+                  <select id={`${ids}-model`} className="input" value={draft.model} onChange={(e) => set("model", e.target.value)}>
                     {modelOptions.map((m) => (
                       <option key={m} value={m}>
                         {m}
@@ -276,9 +287,9 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                   <div className="hint">Small models (1–3B) are fast and light. Output that changes the book's wording is always rejected.</div>
                 </div>
                 <div className="field">
-                  <span>Download a model</span>
+                  <label htmlFor={`${ids}-download`}>Download a model</label>
                   <div className="row">
-                    <input className="input" value={downloadName} onChange={(e) => setDownloadName(e.target.value)} placeholder="qwen2.5:1.5b" />
+                    <input id={`${ids}-download`} className="input" value={downloadName} onChange={(e) => setDownloadName(e.target.value)} placeholder="qwen2.5:1.5b" />
                     <button
                       className="btn small"
                       onClick={download}
@@ -294,8 +305,15 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                   )}
                   {pull && (
                     <div className="pullProgress">
-                      <div className="barOuter">
-                        <div className="barInner" style={{ width: `${pull.done && !pull.error ? 100 : pct}%` }} />
+                      <div
+                        className="barOuter"
+                        role="progressbar"
+                        aria-label={`Downloading ${pull.model}`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={pct}
+                      >
+                        <div className="barInner" style={{ width: `${pct}%` }} />
                       </div>
                       <div className="hint">
                         {pull.model}: {pull.error ? `failed: ${pull.error}` : pull.done ? "downloaded" : `${pull.status} ${formatBytes(pull.completed)} / ${formatBytes(pull.total)}`}
@@ -311,12 +329,14 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
           <fieldset className="settingsGroup">
             <legend>General</legend>
             <div className="row">
-              <span className="radio">Theme</span>
-              <div className="seg" role="group" aria-label="Theme">
-                <button className={general.dark ? "on" : ""} onClick={() => general.onDarkChange(true)}>
+              <span className="fieldCaption" id={`${ids}-theme`}>
+                Theme
+              </span>
+              <div className="seg" role="group" aria-labelledby={`${ids}-theme`}>
+                <button className={general.dark ? "on" : ""} aria-pressed={general.dark} onClick={() => general.onDarkChange(true)}>
                   Dark
                 </button>
-                <button className={!general.dark ? "on" : ""} onClick={() => general.onDarkChange(false)}>
+                <button className={!general.dark ? "on" : ""} aria-pressed={!general.dark} onClick={() => general.onDarkChange(false)}>
                   Light
                 </button>
               </div>
@@ -331,8 +351,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
               <div className="hint">{general.versionText}</div>
               {general.updateStatus && <div className="hint">{general.updateStatus}</div>}
             </div>
-            <div className="field">
-              <span>Diagnostics</span>
+            <div className="field" role="group" aria-labelledby={`${ids}-diagnostics`}>
+              <span id={`${ids}-diagnostics`}>Diagnostics</span>
               <label className="chk">
                 <input type="checkbox" checked={general.logToConsole} onChange={(e) => general.onLogToConsoleChange(e.target.checked)} />
                 Show the log console window
@@ -357,7 +377,7 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
                         const problem = await window.codexEngine!.uninstall!();
                         if (problem) setError(problem);
                       } catch (e) {
-                        setError(`Couldn't start the uninstaller: ${String(e)}`);
+                        setError(`Couldn't start the uninstaller: ${errorText(e)}`);
                       }
                     }}
                   >
@@ -368,11 +388,15 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
             )}
           </fieldset>
 
-          {error && <div className="readerError">{error}</div>}
+          {error && (
+            <div className="errorText" role="alert">
+              {error}
+            </div>
+          )}
 
           <div className="modalActions">
             <span className="hint settingsPath" title={settingsPath}>
-              Saved on this computer: {settingsPath}
+              {settingsPath ? `Saved on this computer: ${settingsPath}` : ""}
             </span>
             {dirty && (
               <button className="btn" onClick={onClose} title="Close without saving">
@@ -380,11 +404,10 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
               </button>
             )}
             <button className="btn primary" onClick={save} disabled={!dirty || saving}>
-              {saving ? "Applying…" : "Save"}
+              {saving ? "Saving…" : "Save"}
             </button>
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }

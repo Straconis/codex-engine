@@ -8,12 +8,12 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
-from pydantic import ValidationError
-
 from codex_engine import ollama_manager as om
 from codex_engine.settings import AppSettings, SettingsStore
+from pydantic import ValidationError
 
 FAKE_SERVER = Path(__file__).with_name("fake_ollama_server.py")
 
@@ -121,7 +121,7 @@ def test_unplugged_companion_drive_is_explained(tmp_path, monkeypatch):
 # ---- manager: managed lifecycle with a fake `ollama serve` -------------------------------------
 
 class FakeServeManager(om.OllamaManager):
-    extra_args: list[str] = []
+    extra_args: ClassVar[list[str]] = []
 
     def _command(self, exe):
         return [sys.executable, str(FAKE_SERVER), *self.extra_args]
@@ -197,7 +197,7 @@ def test_leftover_from_a_crashed_run_is_cleaned_up(managed):
 
 def test_ollama_crashing_at_startup_is_an_error_not_a_hang(managed):
     class Crashing(FakeServeManager):
-        extra_args = ["--exit-immediately"]
+        extra_args: ClassVar[list[str]] = ["--exit-immediately"]
 
     m = managed(cls=Crashing)
     started = time.monotonic()
@@ -249,9 +249,8 @@ def test_only_one_pull_at_a_time_and_names_validated(managed):
 def api(tmp_path, monkeypatch):
     pytest.importorskip("httpx")
     monkeypatch.setenv("CODEX_ENGINE_DB", str(tmp_path / "api.sqlite3"))
-    from fastapi.testclient import TestClient
-
     from codex_engine import app as app_module
+    from fastapi.testclient import TestClient
 
     app_module._schema_ready = False
     app_module.ollama.apply(start=False)
@@ -369,7 +368,7 @@ def test_stop_also_stops_model_runner_processes(managed):
         runner = runners[0]
     else:
         class WithRunner(FakeServeManager):
-            extra_args = ["--spawn-runner"]
+            extra_args: ClassVar[list[str]] = ["--spawn-runner"]
 
         m = managed(cls=WithRunner)
         m.ensure_running()

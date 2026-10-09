@@ -4,7 +4,6 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-
 from codex_engine import ai_format, db
 from codex_engine.formatting import FORMATTER_VERSION
 from codex_engine.models import ChunkRow, PageContent
@@ -110,9 +109,8 @@ class FakeClient:
 @pytest.fixture()
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_ENGINE_DB", str(tmp_path / "api.sqlite3"))
-    from fastapi.testclient import TestClient
-
     from codex_engine import app as app_module
+    from fastapi.testclient import TestClient
 
     app_module._schema_ready = False
     fake = FakeClient()
@@ -135,7 +133,7 @@ SECTION = "The rain fell in torrents, except at occasional intervals, when it wa
 
 
 def test_reader_prefers_ai_then_clean(api, tmp_path):
-    client, app_module, fake = api
+    client, app_module, _fake = api
     sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
 
     page = client.get(f"/api/sources/{sid}/pages/1").json()
@@ -204,7 +202,7 @@ def test_use_cleaned_text_saves_the_sections_that_did_work(api, tmp_path, monkey
 
 
 def test_manual_edit_wins_and_can_be_reverted(api, tmp_path):
-    client, app_module, fake = api
+    client, app_module, _fake = api
     sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
     client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
 
@@ -272,7 +270,7 @@ def test_edits_saved_before_0_3_10_are_indexed_once_on_upgrade(api, tmp_path):
     app_module._schema_ready = False  # next start
     assert search_pages(client, "basilisk") == [1] and search_pages(client, "wyvern") == []
     conn = app_module._conn()
-    assert db.schema_step(conn) == db.EDITS_INDEXED
+    assert db.schema_version(conn) == db.SCHEMA_EDITS_INDEXED
     conn.close()
 
 
@@ -288,7 +286,7 @@ def test_ollama_unavailable_is_503_not_500(api, tmp_path, monkeypatch):
 
 
 def test_ai_output_goes_stale_when_clean_text_changes(api, tmp_path):
-    client, app_module, fake = api
+    client, app_module, _fake = api
     sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
     client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
     conn = app_module._conn()

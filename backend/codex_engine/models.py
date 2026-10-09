@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, StrictBool
 
 
@@ -9,7 +11,7 @@ class SourceRow(BaseModel):
     path: str
     sha256: str
     pages: int
-    enabled: int
+    enabled: bool
     source_key: str
 
 
@@ -35,17 +37,17 @@ class SetEnabledArgs(BaseModel):
 
 
 class StartIngestArgs(BaseModel):
-    path: str
+    path: str = Field(min_length=1, max_length=4096)
 
 
 class ResolveDuplicateArgs(BaseModel):
     ingest_id: int
-    action: str
+    action: Literal["discard", "replace", "new_copy"]
 
 
 class OpenPdfArgs(BaseModel):
-    path: str
-    page: int
+    path: str = Field(min_length=1, max_length=4096)
+    page: int = Field(default=1, ge=1)
 
 
 class IngestProgress(BaseModel):

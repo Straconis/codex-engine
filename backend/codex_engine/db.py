@@ -33,6 +33,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_source_key ON sources(source_key);
         CREATE INDEX IF NOT EXISTS idx_sources_sha256 ON sources(sha256);
         CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
+        CREATE INDEX IF NOT EXISTS idx_sources_path ON sources(path);
 
         CREATE TABLE IF NOT EXISTS chunks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +44,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
           loc TEXT,
           FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id);
+        DROP INDEX IF EXISTS idx_chunks_source;  -- covered by idx_chunks_source_page
+        CREATE INDEX IF NOT EXISTS idx_chunks_source_page ON chunks(source_id, page_num);
         CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page_num);
 
         -- Reader text per page. raw_text is the untouched extraction, clean_md the
@@ -163,25 +165,6 @@ def unique_source_key(conn: sqlite3.Connection, base: str) -> str:
             return key
         index += 1
         key = f"{base}::copy{index}"
-
-
-def create_source(conn: sqlite3.Connection, title: str, path: str, sha: str, pages: int, enabled: bool) -> int:
-    source_key = unique_source_key(conn, sha)
-    cur = conn.execute(
-        "INSERT INTO sources (title, path, sha256, pages, enabled, source_key) VALUES (?,?,?,?,?,?)",
-        (title, path, sha, pages, 1 if enabled else 0, source_key),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
-
-
-def insert_chunks(conn: sqlite3.Connection, source_id: int, chunks: list[ChunkRow]) -> int:
-    conn.executemany(
-        "INSERT INTO chunks (source_id, page_num, heading, body, loc) VALUES (?,?,?,?,?)",
-        [(source_id, c.page_num, c.heading, c.body, c.loc) for c in chunks],
-    )
-    conn.commit()
-    return len(chunks)
 
 
 def create_source_with_chunks(
@@ -354,11 +337,12 @@ def edited_pages(conn: sqlite3.Connection, source_id: int | None = None) -> list
     return [PageRow(**dict(r)) for r in rows]
 
 
-# PRAGMA user_version steps that need code outside this module (see app._conn).
-EDITS_INDEXED = 1
+# Schema versions (PRAGMA user_version) whose upgrade needs code outside this module
+# (see app._conn). 1: edits saved before 0.3.10 are in the search index.
+SCHEMA_EDITS_INDEXED = 1
 
 
-def schema_step(conn: sqlite3.Connection) -> int:
+def schema_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
@@ -367,7 +351,7 @@ def reindex_edits(conn: sqlite3.Connection, chunks_by_page: dict[tuple[int, int]
     with conn:
         for (source_id, page_num), chunks in chunks_by_page.items():
             _replace_page_chunks(conn, source_id, page_num, chunks)
-        conn.execute(f"PRAGMA user_version = {EDITS_INDEXED}")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_EDITS_INDEXED}")
 
 
 def ai_cache_get(conn: sqlite3.Connection, key: str) -> str | None:
@@ -391,7 +375,7 @@ _QUERY_TOKEN_RE = re.compile(r'"[^"]*"\*?|\S+')
 
 
 def build_match_query(raw: str) -> str:
-    """Turn free-form user input into a safe FTS5 MATCH expression.
+    """Turn free-form user input into an FTS5 MATCH expression that can't be a syntax error.
 
     Raw FTS5 syntax blows up on ordinary TTRPG searches like `half-orc`,
     `kenku's`, `d&d`, `+1 sword` or `AC:`. Every term becomes a quoted phrase

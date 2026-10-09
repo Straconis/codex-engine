@@ -8,13 +8,19 @@ const { pathToFileURL } = require("node:url");
 
 const isPackaged = app.isPackaged;
 const ROOT = path.resolve(__dirname, "..");
-const PREFERRED_BACKEND_PORT = Number(process.env.CODEX_ENGINE_PORT || 8787);
+const DEFAULT_BACKEND_PORT = 8787;
+const PREFERRED_BACKEND_PORT = (() => {
+  const port = Number(process.env.CODEX_ENGINE_PORT || DEFAULT_BACKEND_PORT);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BACKEND_PORT;
+})();
 let backendPort = PREFERRED_BACKEND_PORT;
 const backendOrigin = () => `http://127.0.0.1:${backendPort}`;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const DEV_FRONTEND_URL = process.env.CODEX_ENGINE_FRONTEND_URL || "http://127.0.0.1:1420";
 // CODEX_ENGINE_USE_BUILD=1 runs the built UI (dist/) in development, as the installed app does.
 const FRONTEND_URL = isPackaged || process.env.CODEX_ENGINE_USE_BUILD === "1" ? null : DEV_FRONTEND_URL;
+const APP_ID = "com.codexengine.app"; // package.json build.appId; the installer's shortcuts use it too
+const APP_ICON = path.join(ROOT, "assets", "icons-v2", process.platform === "win32" ? "codex-engine-v2.ico" : "codex-engine-v2-256.png");
 const SHUTDOWN_TOKEN = crypto.randomBytes(32).toString("hex");
 // How long to wait for the backend (and its Ollama) to stop by itself before force-closing it.
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3000;
@@ -53,6 +59,7 @@ let mainWindow = null;
 let consoleWindow = null;
 let consoleTailTimer = null;
 const consoleLogOffsets = new Map();
+const consoleLogPartials = new Map(); // file -> the end of a line not fully written yet
 let ownsBackend = false;
 let shuttingDownBackend = false;
 
@@ -272,7 +279,7 @@ async function requestBackendShutdown() {
 }
 
 function consoleLogPaths() {
-  const dir = path.join(app.getPath("userData"), "logs");
+  const dir = logsDir();
   return [
     { label: "backend", file: path.join(dir, "backend.log") },
     { label: "backend", file: path.join(dir, "backend-error.log") },
@@ -328,7 +335,8 @@ function readNewLogContent(label, file) {
     const stat = fs.statSync(file);
     const previousOffset = consoleLogOffsets.get(file) ?? stat.size;
     if (stat.size < previousOffset) {
-      consoleLogOffsets.set(file, 0);
+      consoleLogOffsets.set(file, 0); // rotated
+      consoleLogPartials.delete(file);
       return;
     }
     if (stat.size === previousOffset) return;
@@ -339,10 +347,11 @@ function readNewLogContent(label, file) {
       const buffer = Buffer.alloc(length);
       fs.readSync(fd, buffer, 0, length, previousOffset);
       consoleLogOffsets.set(file, stat.size);
-      const text = buffer.toString("utf8").trimEnd();
-      if (!text) return;
-      for (const line of text.split(/\r?\n/)) {
-        appendConsoleLine(formatConsoleLine(label, line));
+      // Only whole lines: a line the backend is still writing waits for the next read.
+      const lines = ((consoleLogPartials.get(file) ?? "") + buffer.toString("utf8")).split(/\r?\n/);
+      consoleLogPartials.set(file, lines.pop() ?? "");
+      for (const line of lines) {
+        if (line.trim()) appendConsoleLine(formatConsoleLine(label, line));
       }
     } finally {
       fs.closeSync(fd);
@@ -380,10 +389,11 @@ function createConsoleWindow() {
     minHeight: 360,
     title: "Codex Engine Console",
     backgroundColor: "#070b10",
-    icon: path.join(ROOT, "assets", process.platform === "win32" ? "icons-v2/codex-engine-v2.ico" : "icons-v2/codex-engine-v2-256.png"),
+    icon: APP_ICON,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       // Only the log feed: the console must not get the main window's bridge (uninstall etc.).
       preload: path.join(__dirname, "console-preload.cjs"),
     },
@@ -520,7 +530,7 @@ ipcMain.on("codex-engine:renderer-log-file", (event, line) => {
   }
 });
 
-// "Codex Engine 0.3.6": the version comes from package.json (app.getVersion()).
+// "Codex Engine 1.2.3", with the version from package.json (app.getVersion()).
 function windowTitle() {
   return `Codex Engine ${app.getVersion()}`;
 }
@@ -533,10 +543,11 @@ function createWindow() {
     minHeight: 640,
     title: windowTitle(),
     backgroundColor: "#0b0f14",
-    icon: path.join(ROOT, "assets", process.platform === "win32" ? "icons-v2/codex-engine-v2.ico" : "icons-v2/codex-engine-v2-256.png"),
+    icon: APP_ICON,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
@@ -548,6 +559,33 @@ function createWindow() {
     mainWindow = null;
     setConsoleOpen(false);
   });
+
+  // The page crashed or was killed: offer to reload it rather than leave a blank window.
+  mainWindow.webContents.on("render-process-gone", async (_event, details) => {
+    if (details.reason === "clean-exit" || !mainWindow || mainWindow.isDestroyed()) return;
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: "Codex Engine",
+      message: "The Codex Engine window stopped working.",
+      detail: `Reason: ${details.reason}. Your library is safe.`,
+      buttons: ["Reload", "Quit"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0 && mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+    else app.quit();
+  });
+
+  if (FRONTEND_URL) {
+    // Development: say why the window is blank when the Vite dev server isn't running.
+    mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, url, isMainFrame) => {
+      if (!isMainFrame || errorCode === -3) return; // -3: superseded by another navigation
+      dialog.showErrorBox("Codex Engine", `Couldn't load ${url} (${errorDescription}).\n\nStart the dev server with "npm run dev", or set CODEX_ENGINE_USE_BUILD=1 to use the built UI.`);
+    });
+  }
+
+  if (focusWhenShown) mainWindow.focus();
 
   if (FRONTEND_URL) {
     mainWindow.loadURL(FRONTEND_URL);
@@ -569,14 +607,20 @@ app.on("web-contents-created", (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: "deny" }));
 });
 
+// Launching Codex Engine again focuses this window (or the one about to open).
+let focusWhenShown = false;
 app.on("second-instance", () => {
-  if (!mainWindow) return;
+  if (!mainWindow) {
+    focusWhenShown = true;
+    return;
+  }
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.focus();
 });
 
 app.whenReady().then(async () => {
   if (openingDataFolder) return;
+  if (process.platform === "win32") app.setAppUserModelId(APP_ID);
   await startBackend();
   try {
     await waitForPort(backendPort);

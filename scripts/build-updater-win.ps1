@@ -1,24 +1,9 @@
-$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\common.ps1"
 
-function Invoke-Checked($FilePath, [string[]]$Arguments, $WorkingDirectory = $null) {
-  $argText = $Arguments -join " "
-  Write-Host "> $FilePath $argText"
-  if ($WorkingDirectory) { Push-Location $WorkingDirectory }
-  try {
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-      throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $argText"
-    }
-  }
-  finally {
-    if ($WorkingDirectory) { Pop-Location }
-  }
-}
-
-$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$root = $RepoRoot
 $backend = Join-Path $root "backend"
 $icon = Join-Path $root "assets\icons-v2\codex-engine-v2.ico"
-$python = if ($env:CODEX_ENGINE_PYTHON) { $env:CODEX_ENGINE_PYTHON } else { "python" }
+$python = $Python
 
 Invoke-Checked $python @("-m", "pip", "install", "-r", "requirements-build.txt") $backend
 Invoke-Checked $python @(

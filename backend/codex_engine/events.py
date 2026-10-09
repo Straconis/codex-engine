@@ -7,10 +7,9 @@ import threading
 class EventBroker:
     """Fan-out of backend events to every connected SSE client.
 
-    The old single shared queue.Queue meant each event went to exactly one
-    consumer, and every closed EventSource left a threadpool thread blocked on
-    get() forever, silently eating future events and eventually starving the
-    threadpool that serves all the sync endpoints.
+    Each subscriber gets its own asyncio queue on its own event loop, so every client
+    sees every event, and a client that disconnects just unsubscribes (nothing is left
+    blocked waiting on a queue).
     """
 
     def __init__(self) -> None:
