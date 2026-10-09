@@ -102,7 +102,7 @@ python -m pytest backend/tests -q
 
 `npm run build` type-checks and builds the frontend.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs both on every pull request and on every push to `python-refactor` and `Linux`: the backend tests on Windows and Linux, and the frontend build. A pull request shows a green tick when they pass and a red cross when something broke.
+GitHub Actions (`.github/workflows/ci.yml`) runs both on every pull request and on every push to `python-refactor`: the backend tests on Windows and Linux, and the frontend build. A pull request shows a green tick when they pass and a red cross when something broke.
 
 ## Windows packaging
 
