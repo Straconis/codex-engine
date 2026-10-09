@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ntpath
 import os
 import platform
 import subprocess
@@ -56,7 +57,7 @@ def viewer_command(viewer: str, target: Path, page: int) -> list[str] | None:
     Windows drops "#page=N" when it hands a file to the default app, so each viewer gets
     the page in its own command-line syntax.
     """
-    name = Path(viewer).name.lower()
+    name = ntpath.basename(viewer).lower()  # Windows path, read the same way on any OS
     path = str(target)
     if name in ("acrobat.exe", "acrord32.exe", "acrord64.exe", "pdfxedit.exe", "pdfxcview.exe"):
         return [viewer, "/A", f"page={page}", path]

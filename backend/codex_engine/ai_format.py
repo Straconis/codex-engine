@@ -47,11 +47,10 @@ Fix presentation only:
 If the text is already well formatted, return it unchanged.
 Output only the formatted Markdown: no preamble, no notes, no code fences."""
 
-# Validation thresholds (share of words). Markup and dropped page furniture cause small diffs.
+# Validation thresholds. The model may not add a single word; markup is not words.
 MIN_KEPT = 0.95  # of the input's words that must appear, in order, in the output
-MAX_ADDED = 0.04  # of the output's words that may not come from the input
 # The deterministic cleanup already strips running headers/footers, so the model may drop
-# nothing but a stray page number: at most this many tokens, all of them digits.
+# nothing but a stray page number: a line of its own holding at most this many tokens, all digits.
 MAX_DROPPED_NUMBER_RUN = 3
 MIN_LENGTH_RATIO = 0.8  # output chars / input chars
 MAX_LENGTH_RATIO = 1.6
@@ -92,6 +91,7 @@ class AIConfig:
             timeout=float(env("CODEX_ENGINE_AI_TIMEOUT", default.timeout)),
             section_chars=int(env("CODEX_ENGINE_AI_SECTION_CHARS", default.section_chars)),
             max_attempts=max(1, int(env("CODEX_ENGINE_AI_ATTEMPTS", default.max_attempts))),
+            retry_temperature=float(env("CODEX_ENGINE_AI_RETRY_TEMPERATURE", default.retry_temperature)),
         )
 
 
@@ -171,7 +171,10 @@ class OllamaClient:
                         raise AICancelled("Cancelled")
                     if not raw.strip():
                         continue
-                    event = json.loads(raw)
+                    try:
+                        event = json.loads(raw)
+                    except ValueError as exc:
+                        raise AIUnavailable(f"Ollama sent a reply Codex Engine couldn't read ({exc})") from exc
                     if event.get("error"):
                         raise AIUnavailable(f"Ollama error: {event['error']}")
                     piece = event.get("message", {}).get("content", "")
@@ -225,6 +228,18 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[^\W_]+", text)
 
 
+def _page_number_words(text: str) -> set[int]:
+    """Indices (into _words(text)) of words on a line that is nothing but a short number."""
+    found: set[int] = set()
+    index = 0
+    for line in text.splitlines():
+        words = _words(line)
+        if words and len(words) <= MAX_DROPPED_NUMBER_RUN and all(w.isdigit() for w in words):
+            found.update(range(index, index + len(words)))
+        index += len(words)
+    return found
+
+
 def check_faithful(source: str, output: str) -> None:
     """Raise AIFormatError unless `output` is `source` with only layout changes."""
     if not output.strip():
@@ -235,28 +250,30 @@ def check_faithful(source: str, output: str) -> None:
     ratio = len(output) / max(1, len(source))
     if not MIN_LENGTH_RATIO <= ratio <= MAX_LENGTH_RATIO:
         raise AIFormatError(f"output length changed too much ({ratio:.0%} of the input)")
+    page_numbers = _page_number_words(source)
     matcher = difflib.SequenceMatcher(None, src, out, autojunk=False)
-    kept_src = kept_out = 0  # words matched in order (re-joined split words count as kept)
+    kept_src = 0  # words matched in order (re-joined split words count as kept)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             kept_src += i2 - i1
-            kept_out += j2 - j1
         elif tag == "replace":
             # Only splitting/merging the same letters is allowed ("imag ination" -> "imagination").
-            if "".join(src[i1:i2]) != "".join(out[j1:j2]):
-                raise AIFormatError(f"output changed words ({' '.join(src[i1:i2])!r} -> {' '.join(out[j1:j2])!r})")
+            # Never digits: "1 0" -> "10" changes a number.
+            before, after = src[i1:i2], out[j1:j2]
+            if "".join(before) != "".join(after) or any(ch.isdigit() for ch in "".join(before)):
+                raise AIFormatError(f"output changed words ({' '.join(before)!r} -> {' '.join(after)!r})")
             kept_src += i2 - i1
-            kept_out += j2 - j1
         elif tag == "delete":
-            dropped = src[i1:i2]
-            if len(dropped) > MAX_DROPPED_NUMBER_RUN or not all(t.isdigit() for t in dropped):
+            if not all(i in page_numbers for i in range(i1, i2)):
+                dropped = src[i1:i2]
                 raise AIFormatError(f"output dropped text ({' '.join(dropped[:8])!r}{'...' if len(dropped) > 8 else ''})")
+        elif tag == "insert":
+            added = out[j1:j2]
+            context = f" after {src[i1 - 1]!r}" if i1 else ""
+            raise AIFormatError(f"output added text that isn't in the source ({' '.join(added[:8])!r}{context})")
     kept = kept_src / len(src)
-    added = (len(out) - kept_out) / max(1, len(out))
     if kept < MIN_KEPT:
         raise AIFormatError(f"output dropped, reordered or reworded text ({kept:.0%} of words kept in order)")
-    if added > MAX_ADDED:
-        raise AIFormatError(f"output added text that isn't in the source ({added:.0%} new words)")
     _check_punctuation(source, output)
 
 
@@ -267,6 +284,11 @@ _THEMATIC_BREAK_RE = re.compile(r"\s*([-*_])(\s*\1){2,}\s*")
 _LINE_MARKER_RE = re.compile(r"^\s*(?:>\s*)*(?:[-+]\s+|\d{1,3}[.)]\s+)?")
 # Typographic variants of the same mark count as equal.
 _SAME_MARK = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2026": "..."})
+# A hyphen after a letter at a line end or before a space ("imag-" / "imag- ination") may be a
+# word split across lines, which the formatter may re-join. Any other hyphen ("ten-foot", "1-2")
+# belongs to the author.
+SPLIT_HYPHEN = "-\n"
+_TOKEN_RE = re.compile(r"(?P<split>(?<=[^\W\d_])-(?=\s|$))|[^\W_]+|[^\w\s]")
 
 
 def _text_tokens(markdown: str) -> list[str]:
@@ -283,8 +305,14 @@ def _text_tokens(markdown: str) -> list[str]:
         line = re.sub(r"[*#`|\\]", " ", line)
         line = re.sub(r"(?<![^\W_])_|_(?![^\W_])", " ", line)  # emphasis underscores, not snake_case
         line = _LINE_MARKER_RE.sub("", line)
-        tokens.extend(re.findall(r"[^\W_]+|[^\w\s]", line))
+        tokens.extend(SPLIT_HYPHEN if m.group("split") else m.group() for m in _TOKEN_RE.finditer(line))
     return tokens
+
+
+def _rejoined(before: list[str], after: list[str]) -> bool:
+    """`after` is `before` with split-hyphen words re-joined (hyphen dropped or kept)."""
+    pattern = "".join("-?" if t == SPLIT_HYPHEN else re.escape(t) for t in before)
+    return SPLIT_HYPHEN in before and re.fullmatch(pattern, "".join(after)) is not None
 
 
 def _check_punctuation(source: str, output: str) -> None:
@@ -295,12 +323,12 @@ def _check_punctuation(source: str, output: str) -> None:
         if tag == "equal":
             continue
         before, after = src[i1:i2], out[j1:j2]
-        if tag == "replace" and "".join(before).replace("-", "") == "".join(after):
-            continue  # a word split across a line re-joined ("imag-ination" -> "imagination")
+        if tag == "replace" and _rejoined(before, after):
+            continue  # a word split across a line re-joined ("imag- ination" -> "imagination")
         if tag == "delete" and len(before) <= MAX_DROPPED_NUMBER_RUN and all(t.isdigit() for t in before):
             continue  # a stray page number
-        marks_before = [t for t in before if not t[0].isalnum()]
-        marks_after = [t for t in after if not t[0].isalnum()]
+        marks_before = [t.strip() for t in before if not t[0].isalnum()]
+        marks_after = [t.strip() for t in after if not t[0].isalnum()]
         if marks_before == marks_after:
             continue  # only words differ here; the word check has already judged those
         context = next((t for t in reversed(src[:i1]) if t[0].isalnum()), "")
@@ -331,8 +359,11 @@ def describe_changes(source: str, output: str) -> dict:
         changed = source[i1:i2] + output[j1:j2]
         markup += sum(changed.count(ch) for ch in "#*|>`_")
         line_breaks += changed.count("\n")
-    lines_changed = sum(1 for a, b in zip(source.splitlines(), output.splitlines()) if a != b) + abs(
-        len(source.splitlines()) - len(output.splitlines())
+    # A line diff, so one inserted line doesn't make every later line count as changed.
+    lines_changed = sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, source.splitlines(), output.splitlines(), autojunk=False).get_opcodes()
+        if tag != "equal"
     )
     parts = []
     if markup:
@@ -365,20 +396,69 @@ def strip_fences(text: str) -> str:
 
 # ---- sections + caching -----------------------------------------------------------
 
-def split_sections(markdown: str, max_chars: int) -> list[str]:
-    """Group paragraphs into sections of at most ~max_chars (a long paragraph stays whole)."""
-    sections: list[str] = []
+def _split_long(paragraph: str, max_chars: int) -> list[tuple[str, str]]:
+    """Pieces of an over-long paragraph, each with the separator that preceded it.
+
+    Split at line breaks first, then (for a single huge line) after sentence ends, so a long
+    stat block or table can't overflow the model's context. Pieces are re-joined with the
+    same separator, so the page's layout is unchanged.
+    """
+    if len(paragraph) <= max_chars:
+        return [(paragraph, "")]
+    for separator, units in (("\n", paragraph.split("\n")), (" ", re.split(r"(?<=[.!?:;])\s+", paragraph))):
+        if len(units) > 1:
+            break
+    else:
+        return [(paragraph, "")]  # one unbreakable run of text: send it whole
+    pieces: list[tuple[str, str]] = []
     current: list[str] = []
     size = 0
+    for unit in units:
+        if current and size + len(unit) > max_chars:
+            pieces.append((separator.join(current), separator))
+            current, size = [], 0
+        current.append(unit)
+        size += len(unit) + 1
+    pieces.append((separator.join(current), separator))
+    # A single line can still be too long; split it by sentences. The first piece has no separator.
+    out: list[tuple[str, str]] = []
+    for piece, sep in pieces:
+        sub = _split_long(piece, max_chars) if separator == "\n" and len(piece) > max_chars else [(piece, "")]
+        out.append((sub[0][0], sep if out else ""))
+        out.extend(sub[1:])
+    return out
+
+
+def section_parts(markdown: str, max_chars: int) -> list[tuple[str, str]]:
+    """(section, separator before it) pairs; "".join(sep + section) rebuilds the text."""
+    parts: list[tuple[str, str]] = []
+    current: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        if current:
+            parts.append(("\n\n".join(current), "\n\n" if parts else ""))
+
     for para in (p for p in markdown.split("\n\n") if p.strip()):
+        if len(para) > max_chars:
+            flush()
+            current, size = [], 0
+            for piece, sep in _split_long(para, max_chars):
+                parts.append((piece, (sep or "\n\n") if parts else ""))
+            continue
         if current and size + len(para) > max_chars:
-            sections.append("\n\n".join(current))
+            flush()
             current, size = [], 0
         current.append(para)
         size += len(para) + 2
-    if current:
-        sections.append("\n\n".join(current))
-    return sections
+    flush()
+    return parts
+
+
+def split_sections(markdown: str, max_chars: int) -> list[str]:
+    """Group paragraphs into sections of at most ~max_chars; an over-long paragraph is split
+    at line breaks, then at sentence ends."""
+    return [section for section, _ in section_parts(markdown, max_chars)]
 
 
 def content_hash(text: str) -> str:
@@ -393,6 +473,23 @@ class Cache(Protocol):
     def get(self, key: str) -> str | None: ...
 
     def put(self, key: str, model: str, output: str) -> None: ...
+
+
+def is_faithful(source: str, output: str) -> bool:
+    try:
+        check_faithful(source, output)
+    except AIFormatError:
+        return False
+    return True
+
+
+def cached_output(cache: Cache | None, model: str, section: str) -> str | None:
+    """The cached AI output for this section, if it still passes check_faithful.
+
+    Checked on every hit, so output accepted by an older, looser check is never served again.
+    """
+    hit = None if cache is None else cache.get(cache_key(model, section))
+    return hit if hit is not None and is_faithful(section, hit) else None
 
 
 @dataclass
@@ -429,6 +526,16 @@ def max_output_tokens(section: str) -> int:
     (~4 characters per token; markup adds a little.)
     """
     return max(256, len(section) // 2)
+
+
+def reply_token_cap(section: str, messages: list[dict], num_ctx: int) -> int:
+    """max_output_tokens, but never more than the context has left after the prompt.
+
+    If prompt + reply overflow num_ctx, Ollama silently drops the start of the prompt: the
+    system prompt with the rules. (~3 characters per token, on the safe side.)
+    """
+    prompt_tokens = sum(len(m["content"]) for m in messages) // 3
+    return max(64, min(max_output_tokens(section), num_ctx - prompt_tokens))
 
 
 RETRY_PROMPT = (
@@ -473,7 +580,7 @@ def _format_section(
     """
     label = f"Part {index} of {total}" if total > 1 else "This page"
     key = cache_key(model, section)
-    hit = None if force or cache is None else cache.get(key)
+    hit = None if force else cached_output(cache, model, section)
     if hit is not None:
         hooks.log(f"{label}: using the result accepted earlier.")
         result.formatted += 1
@@ -494,7 +601,7 @@ def _format_section(
             client.chat(
                 model,
                 messages,
-                max_output_tokens(section),
+                reply_token_cap(section, messages, config.num_ctx),
                 None if attempt == 1 else max(config.temperature, config.retry_temperature),
                 on_text=lambda chars: hooks.written(chars, len(section)),
                 should_stop=hooks.should_stop,
@@ -556,18 +663,19 @@ def format_markdown(
     if not chosen:
         raise AIUnavailable(f"Ollama has no models installed. Run: ollama pull {config.model}")
 
-    sections = split_sections(text, config.section_chars)
+    parts = section_parts(text, config.section_chars)
+    sections = [section for section, _ in parts]
     total = len(sections)
     result = FormatResult(markdown=text, model=chosen, sections=total, formatted=0, cached=0)
     hooks.log(f"Using {chosen}; the page is split into {total} part{'s' if total != 1 else ''}.")
     out: list[str] = []
     for index, section in enumerate(sections, start=1):
-        if use_clean_for_failed and cache is not None and cache.get(cache_key(chosen, section)) is None:
+        if use_clean_for_failed and cache is not None and cached_output(cache, chosen, section) is None:
             hooks.log(f"Part {index} of {total}: keeping the cleaned text, as you chose.")
             result.failed.append(FailedSection(index=index, reason="kept as cleaned text", attempts=0))
             out.append(section)
             continue
         out.append(_format_section(section, index, total, chosen, client, config, cache, force, result, hooks))
     hooks.progress(total, total, 0)
-    result.markdown = "\n\n".join(out)
+    result.markdown = "".join(sep + section for (_, sep), section in zip(parts, out))
     return result

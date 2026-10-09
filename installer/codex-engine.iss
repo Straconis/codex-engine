@@ -1,7 +1,7 @@
 #define MyAppName "Codex Engine"
 ; Version is passed in by scripts/build-installer-inno.ps1 from package.json.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.7"
+  #define MyAppVersion "0.3.8"
 #endif
 #define MyAppPublisher "Codex Engine"
 #define MyAppExeName "Codex Engine.exe"

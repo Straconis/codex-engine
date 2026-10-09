@@ -27,7 +27,7 @@ Third-party books don't follow a standard layout, so text goes through a formatt
 
 **Reader.** Click a search result to open the page. It shows the best available version: AI formatted, else cleaned, else raw. You can switch between the three, AI format or regenerate the page, and open the original PDF.
 
-**AI formatting (optional)** (`backend/codex_engine/ai_format.py`) sends the page, in sections, to a local model through [Ollama](https://ollama.com). Text never leaves the machine. The model is told to restore structure only (paragraphs, headings, lists, quotations, section breaks, tables) and never to summarise, paraphrase, censor or rewrite. Every section is checked against its source: changing any word, dropping a passage, reordering text or adding new text gets that section rejected, and it keeps its cleaned version. Accepted output is cached by content, so the same text is never sent to the model twice. Without Ollama the app works normally and the reader says AI formatting is off.
+**AI formatting (optional)** (`backend/codex_engine/ai_format.py`) sends the page, in sections, to a local model through [Ollama](https://ollama.com). Text never leaves the machine. The model is told to restore structure only (paragraphs, headings, lists, quotations, section breaks, tables) and never to summarise, paraphrase, censor or rewrite. Long pages are split into sections; a paragraph too long for one section (a big table or stat block) is split at line breaks, then at sentence ends, and put back together exactly. Every section is checked against its source: changing, adding or dropping any word or punctuation mark, reordering text, merging numbers ("1 0" to "10") or removing a hyphen that isn't a word split across a line ("1-2", "ten-foot") gets that section rejected, and it keeps its cleaned version. The only text the model may drop is a page number on a line of its own. Accepted output is cached by content, so the same text is never sent to the model twice, and cached or saved AI output is re-checked against the current rules: anything that no longer passes is formatted again or shown as outdated. One page can only be AI formatted once at a time. Without Ollama the app works normally and the reader says AI formatting is off.
 
 ### Setting up AI formatting (per computer)
 
@@ -46,7 +46,7 @@ Developer overrides (environment variables, take precedence over Settings):
 - `CODEX_ENGINE_SETTINGS`: path of the settings file
 - `CODEX_ENGINE_OLLAMA_URL`: use this Ollama and don't manage one
 - `CODEX_ENGINE_OLLAMA_MODEL`: model to use
-- `CODEX_ENGINE_AI_SECTION_CHARS` (default 3000), `CODEX_ENGINE_AI_NUM_CTX` (8192), `CODEX_ENGINE_AI_TIMEOUT` (300 s), `CODEX_ENGINE_AI_TEMPERATURE` (0)
+- `CODEX_ENGINE_AI_SECTION_CHARS` (default 3000), `CODEX_ENGINE_AI_NUM_CTX` (8192), `CODEX_ENGINE_AI_TIMEOUT` (300 s), `CODEX_ENGINE_AI_TEMPERATURE` (0), `CODEX_ENGINE_AI_RETRY_TEMPERATURE` (0.3), `CODEX_ENGINE_AI_ATTEMPTS` (4)
 
 Note for development on Windows: if the backend runs on a Microsoft Store Python (as the dev `.venv` here does), Windows redirects its app data (database, settings, logs) to `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.*\LocalCache\Local\Codex Engine`. The packaged app uses the normal `%LOCALAPPDATA%\Codex Engine`.
 
@@ -121,7 +121,7 @@ If you already have `release\win-unpacked`, build only the Inno installer:
 npm run installer:inno
 ```
 
-The app version lives in `package.json`. `build-installer-inno.ps1` passes it to Inno Setup, and `build-backend-win.ps1` fails if `backend/codex_engine/config.py` `APP_VERSION` doesn't match, so bump both together.
+The app version lives in `package.json`. `build-installer-inno.ps1` passes it to Inno Setup, and `build-backend-win.ps1` fails if `backend/codex_engine/config.py` `APP_VERSION` doesn't match, so bump both together (along with `package-lock.json` and `installer/codex-engine.iss`), and add a `release-notes-<version>.txt`.
 
 The packaging flow is:
 
