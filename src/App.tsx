@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type AIStatus,
+  type BookAICheck,
   type DuplicateDetectedPayload,
   type IngestProgress,
   type AIPending,
@@ -97,8 +98,26 @@ export default function App() {
   const aiBusy = Boolean(aiRun && !aiRun.finished);
   // Sections the AI still couldn't format after its automatic retries: the user decides what next.
   const [aiDecision, setAiDecision] = useState<{ sourceId: number; page: number; pending: AIPending } | null>(null);
+  // "Check AI pages" for one book, and the "Reformat all" run over its outdated pages.
+  const [bookCheck, setBookCheck] = useState<{ sourceId: number; title: string; report: BookAICheck | null; error: string } | null>(null);
+  const [bookRun, setBookRun] = useState<{
+    total: number;
+    done: number;
+    current: number | null;
+    ok: number[];
+    needsYou: number[];
+    failed: { page: number; message: string }[];
+    stopped: boolean;
+  } | null>(null);
+  const bookStop = useRef(false);
+  // reformatBook runs across many renders; it reads the reader's current state through these.
+  const readerRef = useRef(reader);
+  readerRef.current = reader;
+  const bookRunning = Boolean(bookRun && bookRun.current !== null);
   // Manual edit in progress (the page text being edited), and whether it differs from where it started.
   const [editing, setEditing] = useState<{ text: string; original: string } | null>(null);
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
   const [savingEdit, setSavingEdit] = useState(false);
   // The search the current results came from: its terms are highlighted in the reader.
   const [searchedFor, setSearchedFor] = useState("");
@@ -461,6 +480,89 @@ export default function App() {
       if (!/^Cancelled/.test(message)) setAiNotice(message);
       api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
     }
+  }
+
+  async function checkBookAI(sourceId: number, title: string) {
+    setBookCheck({ sourceId, title, report: null, error: "" });
+    setBookRun(null);
+    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+    try {
+      uiLog(`book_ai_check source=${sourceId}`);
+      const report = await api.checkBookAI(sourceId);
+      setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, report } : c));
+    } catch (e: any) {
+      setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, error: String(e).replace(/^Error: /, "") } : c));
+    }
+  }
+
+  // Reformats the book's outdated pages one at a time, through the same endpoint as the reader's
+  // button, so each page shows in the progress window. A page whose parts still fail after the
+  // automatic retries is left for the user to decide on in the reader, never decided for them.
+  async function reformatBook() {
+    if (!bookCheck?.report || aiBusy) return;
+    const { sourceId, title } = bookCheck;
+    const pages = bookCheck.report.outdated.map((p) => p.page_num);
+    bookStop.current = false;
+    setBookRun({ total: pages.length, done: 0, current: null, ok: [], needsYou: [], failed: [], stopped: false });
+    for (const page of pages) {
+      if (bookStop.current) break;
+      setBookRun((r) => r && { ...r, current: page });
+      setAiRun({ sourceId, page, title, startedAt: Date.now(), done: 0, total: 0, attempt: 0, maxAttempts: 0, written: 0, expected: 0, log: [] });
+      const finish = (kind: NonNullable<AIRun["finished"]>["kind"], message: string) =>
+        setAiRun((run) => (run && run.sourceId === sourceId && run.page === page ? { ...run, finished: { kind, message } } : run));
+      let outcome: "ok" | "needsYou" | "failed" = "failed";
+      let message = "";
+      try {
+        uiLog(`book_reformat source=${sourceId} page=${page}`);
+        const data = await api.aiFormatPage(sourceId, page, { model: aiStatus?.model });
+        if (data.pending) {
+          outcome = "needsYou";
+          finish("decision", `Couldn't format part of page ${page} without changing the text. Open the page to decide.`);
+        } else if (data.ai_error) {
+          message = data.ai_error;
+          finish("error", message);
+        } else {
+          outcome = "ok";
+          finish("ok", `Page ${page} reformatted and checked.`);
+        }
+      } catch (e: any) {
+        message = String(e).replace(/^Error: /, "");
+        finish(/^Cancelled/.test(message) ? "cancelled" : "error", message);
+        if (/^Cancelled/.test(message) || /unavailable/i.test(message)) bookStop.current = true; // stop, or no AI to continue with
+      }
+      setBookRun(
+        (r) =>
+          r && {
+            ...r,
+            done: r.done + 1,
+            ok: outcome === "ok" ? [...r.ok, page] : r.ok,
+            needsYou: outcome === "needsYou" ? [...r.needsYou, page] : r.needsYou,
+            failed: outcome === "failed" ? [...r.failed, { page, message }] : r.failed,
+          }
+      );
+      const open = readerRef.current;
+      if (open && open.sourceId === sourceId && open.page === page && !editingRef.current) loadReaderPage(sourceId, page);
+    }
+    setBookRun((r) => r && { ...r, current: null, stopped: bookStop.current });
+    try {
+      const report = await api.checkBookAI(sourceId);
+      setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, report } : c));
+    } catch {
+      // The run's own summary is still shown.
+    }
+  }
+
+  function stopBookReformat() {
+    bookStop.current = true;
+    cancelAiFormat();
+  }
+
+  function openBookPage(sourceId: number, page: number) {
+    if (bookRunning || !confirmDiscardEdit()) return;
+    setBookCheck(null); // the reader opens underneath this window
+    setReaderPage(null);
+    loadReaderPage(sourceId, page);
+    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
   }
 
   async function cancelAiFormat() {
@@ -1003,6 +1105,13 @@ export default function App() {
 
                     <div className="row">
                       <button
+                        className="btn small"
+                        onClick={() => checkBookAI(s.id, s.title)}
+                        title="Find pages whose AI version is outdated or fails the current text check"
+                      >
+                        Check AI pages
+                      </button>
+                      <button
                         className="btn small danger"
                         onClick={() => deleteSource(s.id)}
                       >
@@ -1447,6 +1556,118 @@ export default function App() {
       )}
 
       {/* Duplicate modal */}
+      {bookCheck && (
+        <div className="overlay" onMouseDown={() => !bookRunning && setBookCheck(null)}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <h3>AI pages in {bookCheck.title}</h3>
+              <button className="btn small" onClick={() => setBookCheck(null)} disabled={bookRunning}>
+                Close
+              </button>
+            </div>
+            <div className="modalBody" style={{ fontSize: 13, lineHeight: 1.5 }}>
+              {bookCheck.error ? (
+                <div className="readerError">{bookCheck.error}</div>
+              ) : !bookCheck.report ? (
+                <div style={{ color: "var(--muted)" }}>Checking every AI-formatted page…</div>
+              ) : bookCheck.report.ai_pages === 0 ? (
+                <div>No pages of this book have been AI formatted yet.</div>
+              ) : bookCheck.report.outdated.length === 0 ? (
+                <div>
+                  All {bookCheck.report.ai_pages} AI-formatted page{bookCheck.report.ai_pages === 1 ? "" : "s"} pass the current
+                  text check.
+                </div>
+              ) : (
+                <>
+                  <div>
+                    {bookCheck.report.outdated.length} of {bookCheck.report.ai_pages} AI-formatted page
+                    {bookCheck.report.ai_pages === 1 ? "" : "s"} need reformatting. Until then the reader shows their cleaned text.
+                  </div>
+                  {(["failed_check", "source_changed"] as const).map((reason) => {
+                    const pages = bookCheck.report!.outdated.filter((p) => p.reason === reason);
+                    if (!pages.length) return null;
+                    return (
+                      <div key={reason} style={{ marginTop: 8 }}>
+                        <b>{reason === "failed_check" ? "Fail the stricter text check" : "Made from older cleaned text"}:</b>{" "}
+                        {pages.map((p, i) => (
+                          <span key={p.page_num}>
+                            {i ? ", " : ""}
+                            <button className="linkBtn" onClick={() => openBookPage(bookCheck.sourceId, p.page_num)} disabled={bookRunning}>
+                              p. {p.page_num}
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
+              {bookRun && (
+                <div style={{ marginTop: 12 }}>
+                  {bookRun.current !== null ? (
+                    <div>
+                      Reformatting page {bookRun.current} ({bookRun.done + 1} of {bookRun.total})…
+                    </div>
+                  ) : (
+                    <div>
+                      {bookRun.stopped ? "Stopped. " : "Finished. "}
+                      {bookRun.ok.length} page{bookRun.ok.length === 1 ? "" : "s"} reformatted and checked.
+                    </div>
+                  )}
+                  {bookRun.needsYou.length > 0 && (
+                    <div style={{ marginTop: 6 }}>
+                      Need your decision (the AI couldn't format part of the page without changing it):{" "}
+                      {bookRun.needsYou.map((page, i) => (
+                        <span key={page}>
+                          {i ? ", " : ""}
+                          <button className="linkBtn" onClick={() => openBookPage(bookCheck.sourceId, page)} disabled={bookRunning}>
+                            p. {page}
+                          </button>
+                        </span>
+                      ))}
+                      . Open a page and press "AI format page" to choose.
+                    </div>
+                  )}
+                  {bookRun.failed.length > 0 && (
+                    <div style={{ marginTop: 6 }}>
+                      Not reformatted:{" "}
+                      {bookRun.failed.map((f) => `p. ${f.page}${f.message ? ` (${f.message})` : ""}`).join("; ")}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="decisionActions" style={{ marginTop: 12 }}>
+                {bookRunning ? (
+                  <button className="btn small" onClick={stopBookReformat}>
+                    Stop
+                  </button>
+                ) : (
+                  bookCheck.report &&
+                  bookCheck.report.outdated.length > 0 && (
+                    <button
+                      className="btn small primary"
+                      onClick={reformatBook}
+                      disabled={aiBusy || !aiStatus?.available}
+                      title={
+                        !aiStatus?.available
+                          ? aiStatus?.error ?? "AI formatting is unavailable"
+                          : aiBusy
+                          ? "Wait for the page being formatted to finish"
+                          : "Reformat these pages one at a time with the local AI"
+                      }
+                    >
+                      Reformat all ({bookCheck.report.outdated.length})
+                    </button>
+                  )
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {dupOpen && dup && (
         <div className="overlay">
           <div className="modal" onMouseDown={(e) => e.stopPropagation()}>

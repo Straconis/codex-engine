@@ -285,6 +285,11 @@ def get_page(conn: sqlite3.Connection, source_id: int, page_num: int) -> PageRow
     return PageRow(**dict(row)) if row else None
 
 
+def pages_with_ai(conn: sqlite3.Connection, source_id: int) -> list[PageRow]:
+    rows = conn.execute(f"{_PAGE_SELECT} WHERE source_id=? AND ai_md IS NOT NULL ORDER BY page_num", (source_id,)).fetchall()
+    return [PageRow(**dict(r)) for r in rows]
+
+
 def set_page_ai(conn: sqlite3.Connection, source_id: int, page_num: int, ai_md: str, ai_model: str, source_hash: str, note: str | None = None) -> None:
     with conn:
         conn.execute(

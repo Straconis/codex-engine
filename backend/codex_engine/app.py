@@ -272,17 +272,31 @@ def _load_page(conn, source_id: int, page_num: int):
     return source, page
 
 
+def _ai_outdated(page) -> str | None:
+    """Why a page's saved AI version can't be shown as current, or None if it can (or there is none).
+
+    "source_changed": the cleaned text changed since. "failed_check": it no longer passes the
+    current (stricter) faithfulness check.
+    """
+    if not page.ai_md:
+        return None
+    if page.ai_source_hash != ai_format.content_hash(page.clean_md):
+        return "source_changed"
+    if not ai_format.is_faithful(page.clean_md, page.ai_md):
+        return "failed_check"
+    return None
+
+
 def _page_response(source, page, pending: dict | None = None):
     """Page plus what the reader should show: the user's edit, else AI, else cleaned, else raw.
 
     pending is set when some sections still failed after the automatic retries and the user
     needs to choose: keep retrying, use the cleaned text for them, or edit the page by hand.
     """
-    # Outdated if the cleaned text changed since, or if it no longer passes the (stricter) check.
-    # ai_check_failed tells the reader which, so it can explain the second case.
-    source_changed = bool(page.ai_md) and page.ai_source_hash != ai_format.content_hash(page.clean_md)
-    ai_check_failed = bool(page.ai_md) and not source_changed and not ai_format.is_faithful(page.clean_md, page.ai_md)
-    ai_stale = source_changed or ai_check_failed
+    # ai_check_failed tells the reader why it's outdated, so it can explain that case.
+    outdated = _ai_outdated(page)
+    ai_stale = outdated is not None
+    ai_check_failed = outdated == "failed_check"
     if page.edited_md is not None:
         best = "edited"
     elif page.ai_md and not ai_stale:
@@ -354,6 +368,22 @@ def get_page(source_id: int, page_num: int):
     conn = _conn()
     try:
         return _page_response(*_load_page(conn, source_id, page_num))
+    finally:
+        conn.close()
+
+
+@app.get("/api/sources/{source_id}/ai-check")
+def check_book_ai(source_id: int):
+    """Every page of a book whose saved AI version is outdated, and why (see _ai_outdated)."""
+    conn = _conn()
+    try:
+        source = db.get_source(conn, source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found.")
+        _ensure_pages_current(conn, source)
+        pages = db.pages_with_ai(conn, source_id)
+        outdated = [{"page_num": p.page_num, "reason": reason} for p in pages if (reason := _ai_outdated(p))]
+        return {"source_id": source_id, "title": source.title, "ai_pages": len(pages), "outdated": outdated}
     finally:
         conn.close()
 
