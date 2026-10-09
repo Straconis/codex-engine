@@ -200,3 +200,48 @@ def test_old_update_files_are_cleaned_up(tmp_path, monkeypatch):
     assert update_client.cleanup_update_files() == 1200
     assert not old_installer.exists() and not old_copy.exists() and fresh.exists()
     assert update_client.cleanup_update_files() == 0  # nothing left to do; missing folders are fine
+
+
+# ---- 0.3.12 ----------------------------------------------------------------------------
+
+def test_uploads_with_the_same_name_arriving_together_never_overwrite_each_other(tmp_path):
+    import io
+    import threading
+
+    from codex_engine.uploads import store_upload
+
+    books = [f"%PDF-1.7 book {n}".encode() * 1000 for n in range(8)]
+    start = threading.Barrier(len(books))
+    stored: dict[int, object] = {}
+
+    def upload(n):
+        start.wait()
+        stored[n] = store_upload(tmp_path, "Core Rules.pdf", io.BytesIO(books[n]))
+
+    threads = [threading.Thread(target=upload, args=(n,)) for n in range(len(books))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(stored.values())) == len(books)
+    for n, path in stored.items():
+        assert path.read_bytes() == books[n]
+    assert not list(tmp_path.glob(".incoming-*"))
+
+
+@pytest.mark.parametrize(
+    "version, expected",
+    [("v0.3.10", (0, 3, 10)), ("0.4.0-rc1", (0, 4, 0)), ("0.3.10+build7", (0, 3, 10)), ("1.2", (1, 2, 0)), ("junk", (0, 0, 0))],
+)
+def test_version_suffixes_are_ignored_not_read_as_digits(version, expected):
+    from codex_engine.updater.update_client import normalize_version
+
+    assert normalize_version(version) == expected
+    assert normalize_version("0.3.10") > normalize_version("0.3.9")
+
+
+def test_search_queries_with_control_characters_or_quoted_prefixes():
+    from codex_engine.db import build_match_query
+
+    assert build_match_query("fire\x00bolt") == '"fire" "bolt"'
+    assert build_match_query('"fire bol"*') == '"fire bol"*'

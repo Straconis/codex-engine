@@ -71,7 +71,11 @@ def perform_update(installer_path: str, app_exe: str) -> int:
         show_message("Codex Engine did not close within 45 seconds.\n\nThe update has been cancelled.", error=True)
         return 1
 
-    installer_result = run_installer(installer_path)
+    try:
+        installer_result = run_installer(installer_path)
+    except OSError as error:
+        show_message(f"The Codex Engine update installer could not be started.\n\n{error}", error=True)
+        return 2
     if installer_result != 0:
         show_message(f"The Codex Engine update installer failed.\n\nInstaller exit code: {installer_result}", error=True)
         return installer_result

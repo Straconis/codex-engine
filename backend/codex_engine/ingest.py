@@ -71,6 +71,14 @@ def page_chunks(page_num: int, markdown: str) -> list[ChunkRow]:
 def rebuild_source(conn, source_id: int, path: Path) -> None:
     """Re-run extraction + cleanup for an already-ingested book (formatter upgrades)."""
     pages, chunks = build_source_content(extract_layouts(path))
+    lost = db.pages_with_user_work_after(conn, source_id, len(pages))
+    if lost:
+        # The file at this path now has fewer pages (it was replaced by another PDF). Rebuilding
+        # would delete the user's edits and AI versions on the missing pages, so don't.
+        raise RuntimeError(
+            f"The PDF now has {len(pages)} pages, but you edited or AI formatted page {lost[0]}; "
+            "the stored pages are kept. Re-add the book to rebuild it."
+        )
     # The user's own edits are kept, so search keeps finding what those pages say.
     edits = {p.page_num: p.edited_md for p in db.edited_pages(conn, source_id) if p.page_num <= len(pages)}
     chunks = [c for c in chunks if c.page_num not in edits]

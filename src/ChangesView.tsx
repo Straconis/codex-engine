@@ -1,9 +1,10 @@
-import type { ReactNode } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 
 // "What did the AI change?" A word-level diff of the AI version against the cleaned text,
 // shown as Markdown source so layout changes (headings, bold, tables, line breaks) are
 // visible. Removed text is struck through, added text highlighted, invisible characters
-// labelled. The words themselves never differ (the AI check guarantees it).
+// labelled. For a current AI version the words never differ (the AI check guarantees it);
+// an outdated one (made from older cleaned text, or failing the current check) can differ.
 
 const INVISIBLE: Record<string, string> = {
   "\u200b": "zero-width space",
@@ -104,15 +105,26 @@ function renderText(text: string, keyPrefix: string): ReactNode[] {
   return out;
 }
 
-export default function ChangesView({ before, after }: { before: string; after: string }) {
-  const ops = diffTokens(tokenize(before), tokenize(after));
-  const { invisible, marks, breaks, other } = describe(ops);
+type Props = {
+  before: string;
+  after: string;
+  aiStale?: boolean; // the AI version was made from older cleaned text (or fails the current check)
+  aiCheckFailed?: boolean; // the AI version fails the current, stricter text check
+};
+
+function ChangesView({ before, after, aiStale = false, aiCheckFailed = false }: Props) {
+  const ops = useMemo(() => diffTokens(tokenize(before), tokenize(after)), [before, after]);
+  const { invisible, marks, breaks, other } = useMemo(() => describe(ops), [ops]);
+  // Only a current AI version that passes the check is guaranteed to keep every word.
+  const wordsSame = !aiStale && !aiCheckFailed;
   const nothing = !marks && !breaks && !other;
   const parts = [
     marks ? `${marks} formatting mark${marks === 1 ? "" : "s"} (# headings, ** bold, | tables, - lists)` : "",
     breaks ? `${breaks} line break${breaks === 1 ? "" : "s"}` : "",
     invisible ? `${invisible} invisible character${invisible === 1 ? "" : "s"} removed` : "",
-    other ? `${other} other character${other === 1 ? "" : "s"} (spacing or re-joined words)` : "",
+    other
+      ? `${other} other character${other === 1 ? "" : "s"} (${wordsSame ? "spacing or re-joined words" : "spacing, re-joined or changed words"})`
+      : "",
   ].filter(Boolean);
 
   return (
@@ -120,6 +132,10 @@ export default function ChangesView({ before, after }: { before: string; after: 
       <div className="changesSummary">
         {nothing ? (
           <b>No layout changes: this page was already well formatted.</b>
+        ) : aiCheckFailed ? (
+          <b>This AI version no longer passes the current text check, so changed words are shown too.</b>
+        ) : aiStale ? (
+          <b>This AI version was made from older cleaned text, so word differences are shown too.</b>
         ) : (
           <b>The AI changed the layout only; every word is the same.</b>
         )}
@@ -143,3 +159,6 @@ export default function ChangesView({ before, after }: { before: string; after: 
     </div>
   );
 }
+
+// Memoized: the diff is O(n*m) and the reader re-renders on every progress tick.
+export default memo(ChangesView);

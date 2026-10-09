@@ -440,3 +440,108 @@ def test_ai_format_reports_what_changed(api, tmp_path):
     page = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={"force": True}, headers=HEADERS).json()
     assert page["ai_changes"]["meaningful"] is False
     assert page["ai_changes"]["summary"].startswith("This page was already well formatted")
+
+
+# ---- 0.3.12: fixes from the 0.3.10 sweep -----------------------------------------------------
+
+def test_a_shorter_pdf_never_deletes_edits_on_the_missing_pages(api, tmp_path):
+    client, app_module, _ = api
+    pdf = tmp_path / "b.pdf"
+    make_pdf(pdf, "One.", "Two.", "Three.")
+    sid = add_source(app_module, pdf, "x", "y", "z", with_pages=False)
+    client.get(f"/api/sources/{sid}/pages/1")
+    client.put(f"/api/sources/{sid}/pages/3/edit", json={"markdown": "My page three."}, headers=HEADERS)
+    make_pdf(pdf, "One.", "Two.")  # the file at that path was replaced by a shorter one
+    conn = app_module._conn()
+    conn.execute("UPDATE pages SET clean_version=0 WHERE source_id=?", (sid,))
+    conn.commit()
+    conn.close()
+
+    assert client.get(f"/api/sources/{sid}/pages/1").status_code == 200  # stored pages still served
+    assert client.get(f"/api/sources/{sid}/pages/3").json()["edited_md"] == "My page three."
+
+
+def test_a_failed_rebuild_is_not_retried_on_every_page_view(api, tmp_path, monkeypatch):
+    client, app_module, _ = api
+    pdf = tmp_path / "b.pdf"
+    make_pdf(pdf, "One.")
+    sid = add_source(app_module, pdf, "stale", version=FORMATTER_VERSION - 1)
+    calls = []
+
+    def broken(conn, source_id, path):
+        calls.append(source_id)
+        raise RuntimeError("damaged PDF")
+
+    monkeypatch.setattr(app_module, "rebuild_source", broken)
+    for _ in range(3):
+        assert client.get(f"/api/sources/{sid}/pages/1").json()["clean_md"] == "stale"
+    assert calls == [sid]
+
+
+def test_search_lists_each_page_once(api, tmp_path):
+    client, app_module, _ = api
+    body = "filler " * 160 + "owlbear " + "filler " * 160  # "owlbear" lands in two overlapping chunks
+    conn = app_module._conn()
+    from codex_engine.ingest import chunk_text
+
+    chunks = chunk_text(1, None, body)
+    assert sum("owlbear" in c.body for c in chunks) == 2
+    db.create_source_with_chunks(conn, "Book", str(tmp_path / "b.pdf"), "h", 1, chunks, page_rows=pages_of(body))
+    conn.close()
+    assert [r["page_num"] for r in client.get("/api/search", params={"query": "owlbear"}).json()] == [1]
+
+
+def test_deleting_a_book_while_a_page_is_formatted_is_a_404_not_a_crash(api, tmp_path):
+    client, app_module, fake = api
+    sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
+
+    def delete_then_answer(text):
+        conn = app_module._conn()
+        db.delete_source(conn, sid)
+        conn.close()
+        return "# " + text
+
+    fake.respond = delete_then_answer
+    r = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+    assert r.status_code == 404 and "removed" in r.json()["detail"]
+
+
+def test_source_toggle_and_delete_validate_their_input(api, tmp_path):
+    client, app_module, _ = api
+    sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
+    assert client.patch(f"/api/sources/{sid}/enabled", json={"enabled": "false"}, headers=HEADERS).status_code == 422
+    assert client.patch(f"/api/sources/{sid}/enabled", json={"enabled": False}, headers=HEADERS).status_code == 200
+    assert client.patch("/api/sources/999/enabled", json={"enabled": True}, headers=HEADERS).status_code == 404
+    assert client.delete("/api/sources/999", headers=HEADERS).status_code == 404
+
+
+def test_upload_rejects_non_pdfs_and_reports_a_full_disk(api, monkeypatch):
+    client, app_module, _ = api
+    r = client.post("/api/ingest/upload", files={"file": ("notes.PDF", b"hello", "application/pdf")}, headers=HEADERS)
+    assert r.status_code == 400 and "isn't a PDF" in r.json()["detail"]
+
+    def full(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(app_module, "store_upload", full)
+    r = client.post("/api/ingest/upload", files={"file": ("a.pdf", b"%PDF-1.7 x", "application/pdf")}, headers=HEADERS)
+    assert r.status_code == 507 and "No space left" in r.json()["detail"]
+
+
+def test_error_messages_have_no_stray_quotes(api):
+    client, _, _ = api
+    r = client.post("/api/ingest/12345/cancel", headers=HEADERS)
+    assert r.status_code == 404 and r.json()["detail"] == "No active ingest with that id."
+
+
+def test_updates_are_only_applied_by_the_windows_app_and_one_at_a_time(api, monkeypatch):
+    client, app_module, _ = api
+    monkeypatch.setattr(app_module, "can_apply_updates", lambda: False)
+    r = client.post("/api/update/apply", json={}, headers=HEADERS)
+    assert r.status_code == 400 and "Windows" in r.json()["detail"]
+    monkeypatch.setattr(app_module, "can_apply_updates", lambda: True)
+    app_module._update_lock.acquire()
+    try:
+        assert client.post("/api/update/apply", json={}, headers=HEADERS).status_code == 409
+    finally:
+        app_module._update_lock.release()

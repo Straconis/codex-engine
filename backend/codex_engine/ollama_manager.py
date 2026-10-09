@@ -6,9 +6,10 @@ OLLAMA_MODELS pointing at the folder from Settings: the system drive on one mach
 a companion drive on another. In "external" mode it just connects to a URL.
 
 The managed process must never outlive the app: on Windows it is placed in a Job
-Object that kills it when the backend exits for any reason (including a crash); on
-Linux it gets a parent-death signal; and a pid file lets the next start clean up
-anything left behind elsewhere. AI being unavailable is a normal state, never an
+Object that kills it when the backend exits for any reason (including a crash);
+elsewhere stop() ends its process group, and a pid file lets the next start clean up
+anything a crash left behind. (Linux's parent-death signal is not used: it fires when
+the *thread* that started Ollama exits, which killed it moments after starting.) AI being unavailable is a normal state, never an
 app failure.
 """
 from __future__ import annotations
@@ -32,6 +33,9 @@ from . import ai_format
 from .settings import AppSettings, SettingsStore
 
 STARTUP_TIMEOUT = 30.0
+# Settings the managed Ollama runs with; changing any of them restarts it.
+OLLAMA_SETTINGS = ("ai_enabled", "manage_ollama", "ollama_path", "models_dir", "managed_port", "external_url")
+RETRY_SECONDS = 10.0  # after a failed start, wait this long before trying again on demand
 
 # Manager states
 IDLE = "idle"  # managed mode, not started yet (starts on app start or first use)
@@ -140,12 +144,6 @@ def _close_job(job, terminate: bool) -> None:
     kernel32.CloseHandle(job)  # with KILL_ON_JOB_CLOSE this also ends anything left
 
 
-def _linux_parent_death_signal():  # runs in the child before exec
-    import ctypes
-
-    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
-
-
 # ---- manager ---------------------------------------------------------------------
 
 @dataclasses.dataclass
@@ -176,6 +174,7 @@ class OllamaManager:
         self._job = None
         self._state = IDLE
         self._message = ""
+        self._failed_at = 0.0  # monotonic time of the last failed start
         self._url = ""
         self._models_dir = ""
         self._exe = ""
@@ -212,7 +211,9 @@ class OllamaManager:
     # -- lifecycle --
 
     def apply(self, start: bool = True) -> None:
-        """(Re)apply settings: stop what no longer matches, then start if managed."""
+        """(Re)apply settings: stop the current Ollama, then start again if managed.
+
+        Callers skip this when no Ollama-related setting changed (see OLLAMA_SETTINGS)."""
         s = self.settings
         with self._lock:
             self._stop_locked()
@@ -227,8 +228,18 @@ class OllamaManager:
             threading.Thread(target=self.ensure_running, daemon=True).start()
 
     def ensure_running(self, timeout: float = STARTUP_TIMEOUT) -> None:
-        """Start managed Ollama if needed and wait until it answers (no-op in other modes)."""
+        """Start managed Ollama if needed and wait until it answers (no-op in other modes).
+
+        After a failure (not installed, drive missing, slow start) it tries again, at most
+        every RETRY_SECONDS, so installing Ollama or plugging the drive back in is noticed.
+        """
         with self._lock:
+            if self._state in (ERROR, NOT_INSTALLED):
+                if self._alive() and ollama_version(self._url):
+                    self._set(RUNNING, "")  # it was only slow to start
+                elif time.monotonic() - self._failed_at >= RETRY_SECONDS:
+                    self._stop_locked()
+                    self._set(IDLE, "")
             if self._state == IDLE or (self._state == RUNNING and not self._alive()):
                 self._start_locked()
             starting = self._state == STARTING
@@ -240,6 +251,8 @@ class OllamaManager:
 
     def _set(self, state: str, message: str) -> None:
         self._state, self._message = state, message
+        if state in (ERROR, NOT_INSTALLED):
+            self._failed_at = time.monotonic()
         if state != STARTING:
             self._ready.set()
         else:
@@ -285,8 +298,6 @@ class OllamaManager:
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
         else:
             kwargs["start_new_session"] = True  # own process group, so stop() can take its runners too
-            if sys.platform.startswith("linux"):
-                kwargs["preexec_fn"] = _linux_parent_death_signal
         try:
             self._proc = subprocess.Popen(self._command(exe), **kwargs)
         except OSError as exc:

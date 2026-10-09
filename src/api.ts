@@ -182,7 +182,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `${response.status} ${response.statusText}`;
     try {
       const body = await response.json();
-      message = body.detail || message;
+      const detail = body?.detail;
+      if (typeof detail === "string" && detail) message = detail;
+      // FastAPI validation errors (422): a list of { loc, msg, type }.
+      else if (Array.isArray(detail) && detail.length)
+        message = detail.map((d: any) => (typeof d?.msg === "string" ? d.msg : JSON.stringify(d))).join("; ");
+      else if (detail != null && typeof detail !== "string") message = JSON.stringify(detail);
     } catch {
       // keep default
     }

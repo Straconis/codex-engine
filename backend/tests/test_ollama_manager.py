@@ -391,3 +391,51 @@ def test_saving_settings_applies_before_the_response_returns(api):
     assert api.get("/api/ai/status").json()["state"] == "off"
     assert api.put("/api/settings", json={"ai_enabled": True}, headers=headers).status_code == 200
     assert api.get("/api/ai/status").json()["state"] == "external"
+
+
+# ---- 0.3.12: fixes from the 0.3.10 sweep -----------------------------------------------------
+
+def test_an_unrelated_save_keeps_a_setting_that_is_invalid_right_now(tmp_path):
+    # e.g. Ollama on a companion drive that is unplugged today
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"ollama_path": "Z:/tools/ollama.exe", "model": "gemma3:1b"}), encoding="utf-8")
+    store = SettingsStore(path)
+    assert store.update({"model": "llama3.2:1b"}).ollama_path == ""  # not usable now...
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["ollama_path"] == "Z:/tools/ollama.exe" and saved["model"] == "llama3.2:1b"  # ...but kept
+
+
+def test_ollama_started_from_a_short_lived_thread_keeps_running(managed):
+    import threading
+
+    m = managed()
+    starter = threading.Thread(target=m.ensure_running)
+    starter.start()
+    starter.join()  # 0.3.10 on Linux: Ollama died with this thread (parent-death signal)
+    time.sleep(1.0)
+    assert m._alive() and m.status()["state"] == "running"
+
+
+def test_installing_ollama_later_is_noticed_without_a_restart(managed, monkeypatch):
+    monkeypatch.setattr(om, "find_ollama", lambda configured="": None)
+    m = managed()
+    m.ensure_running()
+    assert m.status()["state"] == "not_installed"
+    monkeypatch.setattr(om, "find_ollama", lambda configured="": Path(sys.executable))
+    m.ensure_running()
+    assert m.status()["state"] == "not_installed"  # retried at most every RETRY_SECONDS
+    monkeypatch.setattr(om, "RETRY_SECONDS", 0.0)
+    m.ensure_running()
+    assert m.status()["state"] == "running"
+
+
+def test_changing_only_the_model_does_not_restart_ollama(api, monkeypatch):
+    from codex_engine import app as app_module
+
+    calls = []
+    monkeypatch.setattr(app_module.ollama, "apply", lambda start=True: calls.append(start))
+    headers = {"X-Codex-Engine-Client": "1"}
+    assert api.put("/api/settings", json={"model": "gemma3:1b"}, headers=headers).status_code == 200
+    assert calls == []
+    assert api.put("/api/settings", json={"ai_enabled": False}, headers=headers).status_code == 200
+    assert calls == [False]

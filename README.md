@@ -8,7 +8,7 @@ This branch refactors the original Linux-oriented Tauri/Rust backend into a cros
 
 - Import PDFs and extract text page-by-page
 - Chunk and index extracted text into a local SQLite FTS5 database
-- Search across enabled sources
+- Search across enabled sources (each page is listed once, with its best match)
 - Detect duplicate PDFs by SHA-256
 - Enable, disable, and delete sources
 - Open a PDF at a result page through the host OS
@@ -37,7 +37,7 @@ AI settings are stored per computer, in `settings.json` in the app data folder. 
 2. Choose a **model storage folder** with room for models (about 1–5 GB each), e.g. `D:\ollama\models`.
 3. Click **Download** to fetch a model (default `qwen2.5:1.5b`). Progress shows in the panel.
 
-By default **Codex Engine runs Ollama itself** (`ollama serve` with `OLLAMA_MODELS` set to your folder). It runs on its own port (11435), so it never conflicts with an Ollama you run separately, and it stops when the app closes. On Windows, Ollama and its model runners sit in a Job Object, so they also stop if the app crashes. If the model folder's drive isn't connected, the app says so and keeps working without AI.
+By default **Codex Engine runs Ollama itself** (`ollama serve` with `OLLAMA_MODELS` set to your folder). It runs on its own port (11435), so it never conflicts with an Ollama you run separately, and it stops when the app closes. On Windows, Ollama and its model runners sit in a Job Object, so they also stop if the app crashes. If the model folder's drive isn't connected, or Ollama isn't installed yet, the app says so and keeps working without AI; it tries again (at most every 10 seconds) the next time AI is needed, so plugging the drive in or installing Ollama needs no restart. Saving Settings restarts Ollama only when a setting it runs with changed (not for a different model). Elsewhere than Windows, a crashed backend's Ollama is cleaned up the next time the app starts.
 
 Alternatively, choose **I run Ollama myself** and enter its address (default `http://127.0.0.1:11434`, or another machine on your network).
 
