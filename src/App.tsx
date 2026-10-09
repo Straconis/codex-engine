@@ -1083,7 +1083,11 @@ export default function App() {
                   {readerPage ? ` of ${readerPage.page_count}` : ""}
                   {readerPage ? ` • ${VIEW_LABELS[readerView]}` : ""}
                   {readerView === "ai" && readerPage?.ai_model ? ` (${readerPage.ai_model})` : ""}
-                  {readerView === "ai" && readerPage?.ai_stale ? " • outdated, reformat to refresh" : ""}
+                  {readerView === "ai" && readerPage?.ai_stale
+                    ? readerPage.ai_check_failed
+                      ? " • fails the current text check"
+                      : " • outdated, reformat to refresh"
+                    : ""}
                   {readerPage && searchedFor
                     ? ` • ${matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"}` : "no matches"} for “${searchedFor.replace(/"/g, "")}”`
                     : ""}
@@ -1208,6 +1212,30 @@ export default function App() {
             <div className="readerBody" ref={readerBodyRef}>
               {readerError && <div className="readerError">{readerError}</div>}
               {aiNotice && <div className="aiNotice">{aiNotice}</div>}
+              {readerPage?.ai_check_failed && readerView !== "edited" && !aiBusy && !editing && !aiDecision && (
+                <div className="decision" role="status">
+                  <b>The saved AI version of this page didn't pass the stricter text check.</b>
+                  <div className="hint">
+                    It was made by an older version of Codex Engine, whose check could miss an added word, a dropped number
+                    or a removed hyphen. {readerView === "ai" ? "You're viewing it anyway." : "The cleaned text is shown instead."}{" "}
+                    Reformat the page to get an AI version that passes.
+                  </div>
+                  <div className="decisionActions">
+                    <button className="btn small" onClick={() => aiFormatReaderPage()} disabled={!aiStatus?.available}>
+                      Reformat page
+                    </button>
+                    {readerView === "ai" ? (
+                      <button className="btn small" onClick={() => setReaderView("changes")}>
+                        See what it changed
+                      </button>
+                    ) : (
+                      <button className="btn small" onClick={() => setReaderView("ai")}>
+                        Show the old AI version anyway
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
               {aiDecision && !aiBusy && !editing && aiDecision.sourceId === reader.sourceId && aiDecision.page === reader.page && (
                 <div className="decision" role="alert">
                   <b>

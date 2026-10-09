@@ -278,7 +278,11 @@ def _page_response(source, page, pending: dict | None = None):
     pending is set when some sections still failed after the automatic retries and the user
     needs to choose: keep retrying, use the cleaned text for them, or edit the page by hand.
     """
-    ai_stale = bool(page.ai_md) and page.ai_source_hash != ai_format.content_hash(page.clean_md)
+    # Outdated if the cleaned text changed since, or if it no longer passes the (stricter) check.
+    # ai_check_failed tells the reader which, so it can explain the second case.
+    source_changed = bool(page.ai_md) and page.ai_source_hash != ai_format.content_hash(page.clean_md)
+    ai_check_failed = bool(page.ai_md) and not source_changed and not ai_format.is_faithful(page.clean_md, page.ai_md)
+    ai_stale = source_changed or ai_check_failed
     if page.edited_md is not None:
         best = "edited"
     elif page.ai_md and not ai_stale:
@@ -290,6 +294,7 @@ def _page_response(source, page, pending: dict | None = None):
     return {
         **page.model_dump(),
         "ai_stale": ai_stale,
+        "ai_check_failed": ai_check_failed,
         "best": best,
         "pending": pending,
         "page_count": source.pages,
@@ -410,6 +415,9 @@ def ai_format_page(source_id: int, page_num: int, args: AIFormatArgs | None = No
         live = _LiveProgress(source_id, page_num, config.max_attempts)
         cancel = threading.Event()
         with _ai_jobs_lock:
+            # A second run would replace the first one's Cancel flag (and then remove its own).
+            if (source_id, page_num) in _ai_jobs:
+                raise HTTPException(status_code=409, detail="This page is already being formatted.")
             _ai_jobs[(source_id, page_num)] = cancel
         try:
             result = ai_format.format_markdown(

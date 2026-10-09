@@ -146,7 +146,7 @@ def test_snippet_marks_matched_terms_for_highlighting(conn):
 # ---- open PDF at a page -----------------------------------------------------
 
 def test_viewer_commands_pass_the_page(tmp_path):
-    from pathlib import Path
+    import ntpath
 
     from codex_engine.platforming import viewer_command
 
@@ -158,7 +158,7 @@ def test_viewer_commands_pass_the_page(tmp_path):
     edge = viewer_command(r"C:\x\msedge.exe", pdf, 9)
     assert edge[1].startswith("file:///") and edge[1].endswith("#page=9")
     assert viewer_command(r"C:\x\SomeOtherViewer.exe", pdf, 3) is None
-    assert Path(acrobat[0]).name == "Acrobat.exe"
+    assert ntpath.basename(acrobat[0]) == "Acrobat.exe"
 
 
 def test_default_viewer_lookup_on_windows():

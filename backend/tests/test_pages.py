@@ -244,7 +244,22 @@ def test_ai_output_goes_stale_when_clean_text_changes(api, tmp_path):
     conn.commit()
     conn.close()
     page = client.get(f"/api/sources/{sid}/pages/1").json()
-    assert page["ai_stale"] is True and page["best"] == "clean"
+    assert page["ai_stale"] is True and page["ai_check_failed"] is False and page["best"] == "clean"
+
+
+def test_saved_ai_output_that_fails_the_current_check_is_outdated(api, tmp_path):
+    client, app_module, _ = api
+    sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
+    client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+    conn = app_module._conn()
+    conn.execute("UPDATE pages SET ai_md = ai_md || ' not' WHERE source_id=?", (sid,))  # saved by an older, looser check
+    conn.commit()
+    conn.close()
+    page = client.get(f"/api/sources/{sid}/pages/1").json()
+    assert page["ai_stale"] is True and page["ai_check_failed"] is True and page["best"] == "clean"
+    # Reformatting replaces it with output that passes.
+    page = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS).json()
+    assert page["ai_check_failed"] is False and page["best"] == "ai"
 
 
 def test_raw_text_is_last_resort(api, tmp_path):
@@ -312,6 +327,19 @@ def test_ai_format_publishes_progress_events(api, tmp_path, monkeypatch):
     assert log[0].startswith("Using qwen2.5:1.5b") and log[-2].startswith("This page: accepted on attempt 1")
     assert log[-1].startswith("Layout changed on 1 line")  # what the accepted version changed
 
+
+
+def test_second_run_on_the_same_page_is_refused_while_one_is_running(api, tmp_path):
+    client, app_module, fake = api
+    sid = add_source(app_module, tmp_path / "b.pdf", SECTION)
+
+    def respond(text):
+        second = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+        assert second.status_code == 409 and "already being formatted" in second.json()["detail"]
+        return text
+
+    fake.respond = respond
+    assert client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS).status_code == 200
 
 
 def test_cancel_endpoint_stops_formatting_and_changes_nothing(api, tmp_path):

@@ -100,7 +100,8 @@ def test_rejoining_split_words_is_allowed():
 
 def test_only_a_bare_page_number_may_be_dropped():
     body = " ".join([PROSE] * 4)
-    check_faithful("12 " + body, body)  # stray page number
+    check_faithful("12\n" + body, body)  # stray page number on its own line
+    check_faithful(body + "\n\n12", body)
     with pytest.raises(AIFormatError, match="dropped"):
         check_faithful("THE TOME OF STORMS " + body, body)  # cleanup already removes real headers
     sentence = "Then the old wizard opened the door and walked slowly out into the pouring rain alone."
@@ -124,6 +125,33 @@ Large Giant, Typically Chaotic Evil
 **Languages** Common, Giant
 
 **Challenge** 2 (450 XP) **Proficiency Bonus** +2"""
+
+
+# Edits a small model can make that change what a rule says. All of these got through before 0.3.8.
+FOREST = "The party travels through the dark forest toward the ruined keep on the hill. " * 4
+
+
+@pytest.mark.parametrize(
+    "src, bad, reason",
+    [
+        (FOREST + "The door is locked.", FOREST + "The door is not locked.", "added text .*'not' after 'is'"),
+        (FOREST + "The ogre deals 10 damage on a hit.", FOREST + "The ogre deals damage on a hit.", "dropped text .*'10'"),
+        (FOREST + "Roll 12 dice.", FOREST + "Roll dice.", "dropped text .*'12'"),  # a number mid-sentence is not a page number
+        (FOREST + "On a roll of 1-2 the spell fails.", FOREST + "On a roll of 12 the spell fails.", "changed words .*'1 2' -> '12'"),
+        (FOREST + "Roll 1 0 dice.", FOREST + "Roll 10 dice.", "changed words"),
+        (FOREST + "Carry a ten-foot pole.", FOREST + "Carry a tenfoot pole.", "removed '-'"),
+        (FOREST + "Apply a -2 penalty.", FOREST + "Apply a 2 penalty.", "removed '-'"),
+    ],
+)
+def test_meaning_changing_edits_are_rejected(src, bad, reason):
+    with pytest.raises(AIFormatError, match=reason):
+        check_faithful(src, bad)
+
+
+def test_words_split_across_lines_may_be_rejoined():
+    check_faithful(FOREST + "a sense of imag-\nination.", FOREST + "a sense of imagination.")
+    check_faithful(FOREST + "a sense of imag- ination.", FOREST + "a sense of imagination.")
+    check_faithful(FOREST + "a ten-\nfoot pole.", FOREST + "a ten-foot pole.")  # hyphen kept is fine too
 
 
 def test_dropping_a_short_stat_block_line_is_rejected():
@@ -235,6 +263,16 @@ def test_cache_is_keyed_by_model_and_rejections_are_not_cached():
     assert bad_cache.data == {}
 
 
+def test_cached_output_that_fails_the_current_check_is_formatted_again():
+    cache = DictCache()
+    loose = PROSE.replace("violent gust", "not violent gust")  # what the pre-0.3.8 check let through
+    cache.put(ai_format.cache_key("qwen2.5:1.5b", PROSE), "qwen2.5:1.5b", loose)
+    client = FakeClient(lambda t: "# " + t)
+    result = format_markdown(PROSE, client=client, config=CONFIG, cache=cache)
+    assert len(client.calls) == 1 and result.cached == 0
+    assert result.markdown == "# " + PROSE
+
+
 # ---- availability + config ----------------------------------------------------------
 
 def test_no_models_is_unavailable_not_a_crash():
@@ -261,14 +299,33 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("CODEX_ENGINE_OLLAMA_URL", "http://box:11434/")
     monkeypatch.setenv("CODEX_ENGINE_AI_SECTION_CHARS", "1500")
     monkeypatch.setenv("CODEX_ENGINE_AI_ATTEMPTS", "6")
+    monkeypatch.setenv("CODEX_ENGINE_AI_RETRY_TEMPERATURE", "0.5")
     cfg = AIConfig.from_env()
+    assert cfg.retry_temperature == 0.5
     assert (cfg.model, cfg.url, cfg.section_chars, cfg.max_attempts) == ("gemma3:1b", "http://box:11434", 1500, 6)
     assert AIConfig().max_attempts == 4  # 1 try + 3 automatic retries
 
 
-def test_split_sections_keeps_paragraphs_whole():
-    paras = ["a" * 150, "b" * 150, "c" * 500]
+def test_split_sections_keeps_paragraphs_whole_when_they_fit():
+    paras = ["a" * 150, "b" * 150, "c" * 190]
     assert ai_format.split_sections("\n\n".join(paras), 200) == paras
+
+
+def test_an_over_long_paragraph_is_split_at_lines_then_sentences_and_rebuilt_exactly():
+    table = "\n".join(f"| Row {i} | {i * 3} gp |" for i in range(40))  # one paragraph, ~700 chars
+    sentences = " ".join(f"Sentence number {i} ends here." for i in range(30))  # one long line
+    text = PROSE + "\n\n" + table + "\n\n" + sentences
+    parts = ai_format.section_parts(text, 200)
+    assert all(len(section) <= 200 for section, _ in parts)
+    assert "".join(sep + section for section, sep in parts) == text
+    assert format_markdown(text, client=FakeClient(), config=CONFIG).markdown == text
+
+
+def test_reply_cap_leaves_room_for_the_prompt_in_the_context():
+    section = "x" * 3000
+    messages = [{"content": ai_format.SYSTEM_PROMPT}, {"content": section}]
+    assert ai_format.reply_token_cap(section, messages, 8192) == ai_format.max_output_tokens(section)
+    assert ai_format.reply_token_cap(section, messages, 2048) < 2048 - 3000 // 3
 
 
 def test_progress_reports_sections_and_attempts():
@@ -411,6 +468,12 @@ def test_layout_and_invisible_characters_may_change():
     # e.g. from "STR 18 DEX 11", is rejected by the word-order check.)
     table_src = PROSE + "\n\nSTR DEX\n18 (+4) 11 (+0)"
     check_faithful(table_src, PROSE + "\n\n| STR | DEX |\n|---|---|\n| 18 (+4) | 11 (+0) |")
+
+
+def test_describe_changes_counts_only_the_lines_that_changed():
+    source = "\n".join(f"Line {i}." for i in range(10))
+    output = "# Title\n" + source  # one heading line added at the top
+    assert describe_changes(source, output)["lines_changed"] == 1
 
 
 def test_describe_changes_spots_an_already_formatted_page():
