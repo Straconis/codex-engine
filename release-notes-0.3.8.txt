@@ -3,3 +3,4 @@ AI pages made by earlier versions are re-checked when you open them. If one does
 Very long paragraphs (big tables, stat blocks) are now sent to the AI in smaller pieces, so the model can't run out of room and lose its instructions.
 Starting AI formatting on a page that is already being formatted is refused instead of breaking the Cancel button.
 The Changes summary counts changed lines correctly when the AI adds a line.
+Continuous integration: every pull request and push now runs the backend tests (Windows and Linux) and the frontend build on GitHub automatically.

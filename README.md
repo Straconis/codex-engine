@@ -92,6 +92,18 @@ You can still open `http://127.0.0.1:1420` directly for browser debugging.
 
 Set `VITE_CODEX_ENGINE_API` if the backend is not on `http://127.0.0.1:8787`.
 
+### Tests and CI
+
+Run the backend tests from the repo root (install `backend/requirements-dev.txt` as well as `requirements.txt` first):
+
+```bash
+python -m pytest backend/tests -q
+```
+
+`npm run build` type-checks and builds the frontend.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs both on every pull request and on every push to `python-refactor` and `Linux`: the backend tests on Windows and Linux, and the frontend build. A pull request shows a green tick when they pass and a red cross when something broke.
+
 ## Windows packaging
 
 The end-user app should be a single launcher. Electron owns the window and starts a bundled Python backend sidecar.
