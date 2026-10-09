@@ -40,6 +40,15 @@ export type AIPending = {
   draft_md: string; // accepted sections + cleaned text for the failed ones
 };
 
+// Pages of a book whose saved AI version is outdated: the cleaned text changed since
+// ("source_changed") or it fails the current, stricter check ("failed_check").
+export type BookAICheck = {
+  source_id: number;
+  title: string;
+  ai_pages: number;
+  outdated: { page_num: number; reason: "source_changed" | "failed_check" }[];
+};
+
 export type PageView = {
   source_id: number;
   page_num: number;
@@ -196,6 +205,7 @@ export const api = {
   search: (query: string) => request<SearchRow[]>(`/api/search?query=${encodeURIComponent(query)}`),
   getPage: (sourceId: number, page: number) => request<PageView>(`/api/sources/${sourceId}/pages/${page}`),
   aiStatus: () => request<AIStatus>("/api/ai/status"),
+  checkBookAI: (sourceId: number) => request<BookAICheck>(`/api/sources/${sourceId}/ai-check`),
   getSettings: () => request<{ settings: AppSettings; path: string }>("/api/settings"),
   // 422 with a readable message if a value is invalid (e.g. a relative folder path).
   updateSettings: (changes: Partial<AppSettings>) =>

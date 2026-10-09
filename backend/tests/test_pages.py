@@ -262,6 +262,24 @@ def test_saved_ai_output_that_fails_the_current_check_is_outdated(api, tmp_path)
     assert page["ai_check_failed"] is False and page["best"] == "ai"
 
 
+def test_book_check_lists_outdated_ai_pages_and_why(api, tmp_path):
+    client, app_module, _ = api
+    sid = add_source(app_module, tmp_path / "b.pdf", SECTION, SECTION, SECTION)
+    for page in (1, 2, 3):
+        client.post(f"/api/sources/{sid}/pages/{page}/ai-format", json={}, headers=HEADERS)
+    conn = app_module._conn()
+    conn.execute("UPDATE pages SET ai_md = ai_md || ' not' WHERE source_id=? AND page_num=1", (sid,))
+    conn.execute("UPDATE pages SET clean_md = 'different now' WHERE source_id=? AND page_num=3", (sid,))
+    conn.commit()
+    conn.close()
+    report = client.get(f"/api/sources/{sid}/ai-check").json()
+    assert report["ai_pages"] == 3
+    assert report["outdated"] == [{"page_num": 1, "reason": "failed_check"}, {"page_num": 3, "reason": "source_changed"}]
+    client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+    assert [p["page_num"] for p in client.get(f"/api/sources/{sid}/ai-check").json()["outdated"]] == [3]
+    assert client.get("/api/sources/999/ai-check").status_code == 404
+
+
 def test_raw_text_is_last_resort(api, tmp_path):
     client, app_module, _ = api
     sid = add_source(app_module, tmp_path / "b.pdf", "")
