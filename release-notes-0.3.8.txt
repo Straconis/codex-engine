@@ -1,6 +1,5 @@
 Stricter AI check: the AI can no longer add words, drop numbers from the middle of a sentence, merge numbers ("1 0" into "10") or remove hyphens from ranges and compound words ("1-2", "ten-foot"). Edits like "The door is locked" becoming "The door is not locked" used to slip through and are now caught and sent back to the model. The only text it may drop is a page number on a line of its own.
-AI pages made by earlier versions are re-checked when you open them. If one doesn't pass the stricter check, the reader shows it as outdated and falls back to the cleaned text until you format the page again.
+AI pages made by earlier versions are re-checked when you open them. If one doesn't pass the stricter check, the reader shows the cleaned text with a notice explaining why, and buttons to reformat the page or view the old AI version anyway.
 Very long paragraphs (big tables, stat blocks) are now sent to the AI in smaller pieces, so the model can't run out of room and lose its instructions.
 Starting AI formatting on a page that is already being formatted is refused instead of breaking the Cancel button.
 The Changes summary counts changed lines correctly when the AI adds a line.
-Continuous integration: every pull request and push now runs the backend tests (Windows and Linux) and the frontend build on GitHub automatically.

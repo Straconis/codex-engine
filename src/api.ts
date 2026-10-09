@@ -53,7 +53,8 @@ export type PageView = {
   ai_model: string | null;
   ai_error: string | null; // last AI attempt's rejection/partial note; cleaned text is used instead
   ai_updated_at: string | null;
-  ai_stale: boolean; // ai_md was made from an older cleanup of this page
+  ai_stale: boolean; // ai_md was made from an older cleanup of this page, or fails the current check
+  ai_check_failed?: boolean; // ai_md fails the current (stricter) faithfulness check
   edited_md: string | null; // the user's own correction; shown before anything else
   ai_changes?: AIChanges | null; // only on an ai-format response that saved a new AI version
   edited_at: string | null;

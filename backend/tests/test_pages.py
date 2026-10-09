@@ -244,7 +244,7 @@ def test_ai_output_goes_stale_when_clean_text_changes(api, tmp_path):
     conn.commit()
     conn.close()
     page = client.get(f"/api/sources/{sid}/pages/1").json()
-    assert page["ai_stale"] is True and page["best"] == "clean"
+    assert page["ai_stale"] is True and page["ai_check_failed"] is False and page["best"] == "clean"
 
 
 def test_saved_ai_output_that_fails_the_current_check_is_outdated(api, tmp_path):
@@ -256,7 +256,10 @@ def test_saved_ai_output_that_fails_the_current_check_is_outdated(api, tmp_path)
     conn.commit()
     conn.close()
     page = client.get(f"/api/sources/{sid}/pages/1").json()
-    assert page["ai_stale"] is True and page["best"] == "clean"
+    assert page["ai_stale"] is True and page["ai_check_failed"] is True and page["best"] == "clean"
+    # Reformatting replaces it with output that passes.
+    page = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS).json()
+    assert page["ai_check_failed"] is False and page["best"] == "ai"
 
 
 def test_raw_text_is_last_resort(api, tmp_path):
