@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
+import { formatElapsed, percent } from "./format";
 
 // Floating window that shows what AI formatting is doing: a progress bar fed by the model's
 // streamed reply, the current part and attempt, and a plain-language log. It sits above the
@@ -19,21 +20,17 @@ export type AIRun = {
   finished?: { kind: "ok" | "partial" | "decision" | "cancelled" | "error"; message: string };
 };
 
-/** 0-1 overall progress: finished parts plus how far the current reply has been written. */
-export function runProgress(run: AIRun): number {
-  if (run.finished) return run.finished.kind === "ok" || run.finished.kind === "partial" ? 1 : progressSoFar(run);
-  return progressSoFar(run);
+/** A run that has just started: nothing reported by the backend yet. */
+export function newAIRun(sourceId: number, page: number, title: string): AIRun {
+  return { sourceId, page, title, startedAt: Date.now(), done: 0, total: 0, attempt: 0, maxAttempts: 0, written: 0, expected: 0, log: [] };
 }
 
-function progressSoFar(run: AIRun): number {
+/** 0-1 overall progress: finished parts plus how far the current reply has been written. */
+function runProgress(run: AIRun): number {
+  if (run.finished?.kind === "ok" || run.finished?.kind === "partial") return 1;
   if (!run.total) return 0;
   const part = run.attempt > 0 && run.expected > 0 ? Math.min(run.written / run.expected, 0.98) : 0;
   return Math.min(1, (run.done + part) / run.total);
-}
-
-function elapsed(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 type Props = {
@@ -45,8 +42,9 @@ type Props = {
 };
 
 export default function AIProgressWindow({ run, readerOnPage, onCancel, onClose, onShowPage }: Props) {
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
   const [collapsed, setCollapsed] = useState(false);
+  const logId = useId();
   const running = !run.finished;
 
   useEffect(() => {
@@ -55,56 +53,67 @@ export default function AIProgressWindow({ run, readerOnPage, onCancel, onClose,
     return () => window.clearInterval(timer);
   }, [running]);
 
-  const pct = Math.round(runProgress(run) * 100);
+  const pct = percent(runProgress(run), 1);
+  const indeterminate = running && run.total === 0;
   const part = run.total > 1 ? `Part ${Math.min(run.done + 1, run.total)} of ${run.total}` : "This page";
   const attemptText =
     run.attempt > 1 ? `retry ${run.attempt - 1} of ${run.maxAttempts - 1}, with a correction` : run.attempt === 1 ? "first attempt" : "";
   const recent = run.log.slice(-8);
 
   return (
-    <div className={`aiWindow${run.finished ? ` done-${run.finished.kind}` : ""}`} role="status" aria-live="polite">
+    // Only the status line is a live region: the clock and log would be read out on every tick.
+    <div className={`aiWindow${run.finished ? ` done-${run.finished.kind}` : ""}`} role="region" aria-label="AI formatting progress">
       <div className="aiWindowHeader">
         <div className="aiWindowTitle">
           <b>{running ? "AI formatting…" : "AI formatting"}</b>
           <span className="hint" title={run.title}>
-            {run.title} • p. {run.page}
+            {run.title} · p. {run.page}
           </span>
         </div>
-        <button className="btn small" onClick={() => setCollapsed((c) => !c)} title={collapsed ? "Show details" : "Hide details"}>
+        <button
+          className="btn small"
+          onClick={() => setCollapsed((c) => !c)}
+          title={collapsed ? "Show details" : "Hide details"}
+          aria-expanded={!collapsed}
+          aria-controls={logId}
+        >
           {collapsed ? "Details" : "Hide"}
         </button>
       </div>
 
-      <div className="barOuter" aria-label={`${pct}% done`}>
-        <div className={`barInner${running && run.total === 0 ? " indeterminate" : ""}`} style={{ width: `${running && run.total === 0 ? 30 : pct}%` }} />
+      <div
+        className="barOuter"
+        role="progressbar"
+        aria-label="AI formatting progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={indeterminate ? undefined : pct}
+      >
+        <div className={`barInner${indeterminate ? " indeterminate" : ""}`} style={{ width: `${indeterminate ? 30 : pct}%` }} />
       </div>
 
       <div className="aiWindowStatus">
-        {running ? (
-          run.total === 0 ? (
-            <span>Starting… (loading the model can take a few seconds)</span>
-          ) : (
-            <span>
-              {part}
-              {attemptText ? ` • ${attemptText}` : ""}
-              {run.attempt > 0 && run.expected > 0
-                ? ` • written ${Math.min(run.written, run.expected * 2).toLocaleString()} of ~${run.expected.toLocaleString()} characters`
-                : ""}
-            </span>
-          )
-        ) : (
-          <span>{run.finished!.message}</span>
-        )}
+        <span role="status">
+          {run.finished
+            ? run.finished.message
+            : run.total === 0
+            ? "Starting… (loading the model can take a few seconds)"
+            : `${part}${attemptText ? ` · ${attemptText}` : ""}${
+                run.attempt > 0 && run.expected > 0
+                  ? ` · written ${Math.min(run.written, run.expected * 2).toLocaleString()} of ~${run.expected.toLocaleString()} characters`
+                  : ""
+              }`}
+        </span>
         <span className="hint">
-          {pct}% • {elapsed((run.finished ? run.log[run.log.length - 1]?.at ?? now : now) - run.startedAt)}
+          {pct}% · {formatElapsed((run.finished ? run.log[run.log.length - 1]?.at ?? now : now) - run.startedAt)}
         </span>
       </div>
 
       {!collapsed && recent.length > 0 && (
-        <ol className="aiWindowLog">
+        <ol className="aiWindowLog" id={logId}>
           {recent.map((entry, i) => (
             <li key={run.log.length - recent.length + i}>
-              <span className="hint">{elapsed(entry.at - run.startedAt)}</span> {entry.message}
+              <span className="hint">{formatElapsed(entry.at - run.startedAt)}</span> {entry.message}
             </li>
           ))}
         </ol>

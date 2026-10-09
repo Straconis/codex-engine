@@ -14,7 +14,9 @@ const INVISIBLE: Record<string, string> = {
   "\ufeff": "byte-order mark",
   "\u00ad": "soft hyphen",
 };
-const TOKEN_RE = /\n|[ \t]+|[\p{L}\p{N}]+|[\u200b\u200c\u200d\u2060\ufeff\u00ad]|./gsu;
+// Invisible characters are listed as alternatives, not a [class]: a joiner inside a class reads
+// like a joined emoji sequence.
+const TOKEN_RE = /\n|[ \t]+|[\p{L}\p{N}]+|\u200b|\u200c|\u200d|\u2060|\ufeff|\u00ad|./gsu;
 
 type Op = { kind: "same" | "del" | "ins"; text: string };
 
@@ -23,7 +25,7 @@ function tokenize(text: string): string[] {
 }
 
 /** Longest-common-subsequence diff of two token lists (pages are small enough for O(n*m)). */
-export function diffTokens(a: string[], b: string[]): Op[] {
+function diffTokens(a: string[], b: string[]): Op[] {
   // Trim the common prefix/suffix first: most of a page is usually unchanged.
   let start = 0;
   while (start < a.length && start < b.length && a[start] === b[start]) start++;
@@ -139,7 +141,7 @@ function ChangesView({ before, after, aiStale = false, aiCheckFailed = false }: 
         ) : (
           <b>The AI changed the layout only; every word is the same.</b>
         )}
-        {parts.length > 0 && <div className="hint">{parts.join(" \u2022 ")}</div>}
+        {parts.length > 0 && <div className="hint">{parts.join(" \u00b7 ")}</div>}
         <div className="hint">
           Shown as the page's Markdown source. <del>Struck through</del> = removed, <ins>highlighted</ins> = added,
           compared with the Cleaned version.

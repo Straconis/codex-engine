@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # Bump whenever the cleanup output changes: stored pages made by an older version are
@@ -87,7 +88,7 @@ class PageLayout:
 def _clean_text(text: str) -> str:
     for lig, rep in LIGATURES.items():
         text = text.replace(lig, rep)
-    # U+FFFD between letters is almost always a curly apostrophe the font couldn't map.
+    # U+FFFD between letters is usually a curly apostrophe the font couldn't map (it can also be another glyph, e.g. a dash).
     text = re.sub(r"(?<=[A-Za-z])\ufffd(?=[A-Za-z]|\s|$)", "'", text)  # "creatures\ufffd spaces" -> "creatures' spaces"
     text = re.sub(r"(?<=\d)\ufffd(?=\d)", "\u2013", text)  # "Recharge 5\ufffd6" -> "5-6" (en dash)
     return text.replace("\u00ad", "").replace("\u00a0", " ").replace("\t", " ")
@@ -97,7 +98,7 @@ def layout_from_pymupdf(page) -> PageLayout:
     """Convert a pymupdf.Page into our layout model (kept separate so tests need no PDF)."""
     import pymupdf
 
-    # TEXTFLAGS_TEXT skips image data: ~17x faster on art-heavy books.
+    # TEXTFLAGS_TEXT skips image data, which makes art-heavy books much faster to read.
     data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)
     layout = PageLayout(
         height=float(data.get("height") or page.rect.height),
@@ -477,14 +478,22 @@ def _ability_tables(parts: list[str]) -> list[str]:
     return out
 
 
-def format_document(pages: list[PageLayout]) -> list[str]:
-    """Clean every page of a document; returns one Markdown string per page."""
+def format_document(pages: list[PageLayout], on_page: Callable[[int, int], None] | None = None) -> list[str]:
+    """Clean every page of a document; returns one Markdown string per page.
+
+    `on_page(index, total)` runs before each page is rendered (and may raise to stop).
+    """
     boilerplate = find_boilerplate(pages)
     body_size = body_font_size(pages)
     mark_runin_labels(pages)
     keep_hyphen = hyphenated_vocabulary(pages)
     common = common_fonts(pages)
-    return [render_page(page, body_size, boilerplate, keep_hyphen, common) for page in pages]
+    rendered: list[str] = []
+    for index, page in enumerate(pages, start=1):
+        if on_page:
+            on_page(index, len(pages))
+        rendered.append(render_page(page, body_size, boilerplate, keep_hyphen, common))
+    return rendered
 
 
 # ---- helpers for search -----------------------------------------------------

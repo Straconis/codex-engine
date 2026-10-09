@@ -1,0 +1,7 @@
+Clearer wording. "Ingest PDF" is now "Add PDF", the import and duplicate windows use plain words, a cancelled import says it was cancelled instead of "failed", and counts read properly ("1 result", "2 results"). A PDF with no pages is refused with a clear message.
+Easier to use with the keyboard. Escape closes Settings, the import window and the book check; search results can be reached with Tab and opened with Enter; focus is always visible; and screen readers get proper dialogs, labels and progress bars.
+Small fixes: turning a book off removes its results from the current list, "Cancel import" is disabled once the import is done, pop-ups now sit above the AI progress window, light mode shows button borders on hover, and the AI window shows partial results and errors in different colours.
+Deleting a book now also deletes the copy of its PDF that Codex Engine kept in its own uploads folder.
+If the window crashes, Codex Engine offers to reload it instead of showing a blank window. Starting Codex Engine again while it is opening now brings it to the front.
+Smaller download: unused images and the old Rust version's files are gone, and the app logo is much smaller.
+The installer now names Straconis as the publisher, needs Windows 10 or later, and pins to the taskbar together with the running app.

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import hashlib
+import sys
 import threading
-import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +12,16 @@ from . import db
 from .formatting import FORMATTER_VERSION, PageLayout, first_heading, format_document, layout_from_pymupdf, markdown_to_plain
 from .models import ChunkRow, DuplicateDetectedPayload, IngestProgress, PageContent
 from .platforming import normalize_pdf_path
+from .uploads import file_sha256
+
+
+class IngestCancelled(Exception):
+    """The user cancelled the import; nothing was written."""
+
+
+def _stop_if(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise IngestCancelled
 
 
 def file_title_from_path(path: Path) -> str:
@@ -19,13 +29,7 @@ def file_title_from_path(path: Path) -> str:
 
 
 def sha256_hex(path: Path, cancel: threading.Event) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            if cancel.is_set():
-                raise RuntimeError("Cancelled")
-            digest.update(block)
-    return digest.hexdigest()
+    return file_sha256(path, lambda: _stop_if(cancel))
 
 
 def extract_layouts(path: Path, cancel: threading.Event | None = None) -> list[PageLayout]:
@@ -34,8 +38,7 @@ def extract_layouts(path: Path, cancel: threading.Event | None = None) -> list[P
         if doc.needs_pass:
             raise RuntimeError("PDF appears to be encrypted/password-protected. Cannot ingest encrypted PDFs.")
         for page in doc:
-            if cancel is not None and cancel.is_set():
-                raise RuntimeError("Cancelled")
+            _stop_if(cancel)
             layouts.append(layout_from_pymupdf(page))
     return layouts
 
@@ -48,17 +51,23 @@ def build_page_texts(path: Path, cancel: threading.Event | None = None) -> list[
 def build_source_content(
     layouts: list[PageLayout], cancel: threading.Event | None = None, on_page=None
 ) -> tuple[list[PageContent], list[ChunkRow]]:
-    """Deterministic cleanup for a whole document, plus search chunks built from it."""
-    cleaned = format_document(layouts)
+    """Deterministic cleanup for a whole document, plus search chunks built from it.
+
+    Cleanup is the slow part, so `on_page(index, total)` reports it page by page, and
+    `cancel` is checked before each page.
+    """
+
+    def cleaning(index: int, total: int) -> None:
+        _stop_if(cancel)
+        if on_page:
+            on_page(index, total)
+
+    cleaned = format_document(layouts, cleaning)
     pages: list[PageContent] = []
     chunks: list[ChunkRow] = []
     for index, (layout, text) in enumerate(zip(layouts, cleaned), start=1):
-        if cancel is not None and cancel.is_set():
-            raise RuntimeError("Cancelled")
         pages.append(PageContent(raw_text=layout.raw_text, clean_md=text, clean_version=FORMATTER_VERSION))
         chunks.extend(page_chunks(index, text))
-        if on_page:
-            on_page(index, len(layouts))
     return pages, chunks
 
 
@@ -149,9 +158,9 @@ class IngestManager:
             self._next_id += 1
             job = IngestJob(ingest_id)
             self._jobs[ingest_id] = job
-        thread = threading.Thread(target=self._worker, args=(job, path), daemon=True)
-        thread.start()
-        self._progress(ingest_id, "queued", f"Queued (#{ingest_id}). Hashing / validating...", 0, 1)
+        # Announced before the worker starts, so it always arrives before the worker's own steps.
+        self._progress(ingest_id, "queued", "Waiting to start…", 0, 1)
+        threading.Thread(target=self._worker, args=(job, path), daemon=True).start()
         return ingest_id
 
     def cancel(self, ingest_id: int) -> None:
@@ -162,8 +171,6 @@ class IngestManager:
         job.duplicate_event.set()
 
     def resolve_duplicate(self, ingest_id: int, action: str) -> None:
-        if action not in {"discard", "replace", "new_copy"}:
-            raise ValueError("Invalid action.")
         job = self._jobs.get(ingest_id)
         if not job:
             raise KeyError("No pending duplicate decision for that ingest_id.")
@@ -173,7 +180,8 @@ class IngestManager:
     def _progress(self, ingest_id: int, stage: str, message: str, current: int, total: int, done: bool = False, error: str | None = None) -> None:
         self._emit_progress(IngestProgress(id=ingest_id, stage=stage, message=message, current=current, total=total, done=done, error=error))
 
-    def _discard_managed_file(self, conn, path: Path) -> None:
+    def discard_managed_file(self, conn, path: Path) -> None:
+        """Delete `path` if it's a PDF the app copied into its uploads folder and no book uses it."""
         if not self._managed_dir:
             return
         try:
@@ -187,11 +195,8 @@ class IngestManager:
 
     def _worker(self, job: IngestJob, path: Path) -> None:
         try:
-            self._progress(job.id, "validate", "Validating PDF...", 0, 1)
-            if job.cancel.is_set():
-                raise RuntimeError("Cancelled")
-
-            self._progress(job.id, "hash", "Hashing file (sha256)...", 0, 1)
+            _stop_if(job.cancel)
+            self._progress(job.id, "hash", "Checking whether this book is already in the library…", 0, 1)
             file_hash = sha256_hex(path, job.cancel)
             conn = self._conn_factory()
             try:
@@ -208,34 +213,32 @@ class IngestManager:
                         existing_path=existing.path,
                     )
                     self._emit_duplicate(payload)
-                    self._progress(job.id, "duplicate", "Duplicate detected. Waiting for your choice...", 0, 1)
+                    self._progress(job.id, "duplicate", "This book is already in the library. Waiting for your choice…", 0, 1)
                     while not job.duplicate_event.wait(0.2):
-                        if job.cancel.is_set():
-                            raise RuntimeError("Cancelled")
-                    if job.cancel.is_set():
-                        raise RuntimeError("Cancelled")
+                        _stop_if(job.cancel)
+                    _stop_if(job.cancel)
                     if job.duplicate_choice == "discard":
-                        self._discard_managed_file(conn, path)
-                        self._progress(job.id, "done", "Duplicate detected. Kept original; discarded new ingest.", 1, 1, True)
+                        self.discard_managed_file(conn, path)
+                        self._progress(job.id, "done", "Kept the book already in the library; the new copy wasn't added.", 1, 1, True)
                         return
                     if job.duplicate_choice == "replace":
                         # Deleted only once the new copy is fully extracted and written.
                         replace_source_id = existing.id
 
-                self._progress(job.id, "extract", "Extracting text with PyMuPDF...", 0, 1)
+                self._progress(job.id, "extract", "Reading the PDF…", 0, 1)
                 layouts = extract_layouts(path, job.cancel)
                 page_count = len(layouts)
-                total = max(1, page_count)
-                self._progress(job.id, "chunk", "Cleaning up layout and chunking pages...", 0, total)
+                if not page_count:
+                    raise ValueError("This PDF has no pages.")
+                self._progress(job.id, "chunk", "Cleaning up the text…", 0, page_count)
                 pages, all_chunks = build_source_content(
                     layouts,
                     job.cancel,
-                    lambda index, n: self._progress(job.id, "chunk", f"Chunking page {index}/{n}...", index, n),
+                    lambda index, n: self._progress(job.id, "chunk", f"Cleaning up page {index} of {n}…", index, n),
                 )
 
-                if job.cancel.is_set():
-                    raise RuntimeError("Cancelled")
-                self._progress(job.id, "db", f"Writing {len(all_chunks)} chunks to database...", 0, 1)
+                _stop_if(job.cancel)
+                self._progress(job.id, "db", "Saving to the library…", 0, 1)
                 db.create_source_with_chunks(
                     conn,
                     file_title_from_path(path),
@@ -246,11 +249,15 @@ class IngestManager:
                     replace_source_id=replace_source_id,
                     page_rows=pages,
                 )
-                self._progress(job.id, "done", f"Ingest complete. Pages: {page_count} - Chunks: {len(all_chunks)}", 1, 1, True)
+                pages_word = "page" if page_count == 1 else "pages"
+                self._progress(job.id, "done", f"Added to the library ({page_count} {pages_word}).", 1, 1, True)
             finally:
                 conn.close()
+        except IngestCancelled:
+            self._progress(job.id, "cancelled", "Cancelled. Nothing was added.", 0, 0, True)
         except Exception as exc:
-            self._progress(job.id, "error", "Ingest failed", 0, 0, True, str(exc))
+            if not isinstance(exc, (ValueError, RuntimeError, OSError)):
+                traceback.print_exc(file=sys.stderr)  # an unexpected failure: keep the details in the log
+            self._progress(job.id, "error", "Couldn't add the book", 0, 0, True, str(exc) or type(exc).__name__)
         finally:
-            time.sleep(0.1)
             self._jobs.pop(job.id, None)

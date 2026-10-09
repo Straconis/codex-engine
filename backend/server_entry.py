@@ -4,10 +4,10 @@ import argparse
 import ipaddress
 import sys
 import threading
-from typing import BinaryIO, Callable
+from collections.abc import Callable
+from typing import BinaryIO
 
 import uvicorn
-
 from codex_engine.app import app, stop_and_exit
 
 

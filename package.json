@@ -1,13 +1,21 @@
 {
   "name": "codex-engine",
   "private": true,
-  "version": "0.3.13",
+  "version": "0.3.14",
+  "description": "Index, search and read your own tabletop RPG PDFs, on your own computer.",
+  "author": "Straconis",
+  "homepage": "https://github.com/Straconis/codex-engine",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Straconis/codex-engine.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
     "desktop": "electron .",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "lint": "eslint .",
     "backend": "python -m uvicorn codex_engine.app:app --app-dir backend --host 127.0.0.1 --port 8787 --reload",
     "build:backend:win": "powershell -ExecutionPolicy Bypass -File scripts/build-backend-win.ps1",
     "package:dir": "electron-builder --win dir",
@@ -20,12 +28,17 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "electron": "^44.4.5",
     "electron-builder": "^26.0.12",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.12.0",
     "typescript": "~5.8.3",
+    "typescript-eslint": "^8.70.1",
     "vite": "^7.0.4"
   },
   "main": "electron/main.cjs",
@@ -37,9 +50,8 @@
     },
     "files": [
       "dist/**",
-      "!dist/win-unpacked/**",
       "electron/**",
-      "assets/**",
+      "assets/icons-v2/**",
       "package.json"
     ],
     "extraResources": [
@@ -55,13 +67,6 @@
     "win": {
       "icon": "assets/icons-v2/codex-engine-v2.ico",
       "target": "dir"
-    },
-    "mac": {
-      "icon": "assets/icons-v2/codex-engine-v2-512.png"
-    },
-    "linux": {
-      "icon": "assets/icons-v2/codex-engine-v2-512.png",
-      "target": "AppImage"
     }
   },
   "allowScripts": {

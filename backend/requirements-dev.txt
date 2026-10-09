@@ -1,2 +1,6 @@
+-r requirements.txt
 pytest>=8,<9
 httpx>=0.27,<1
+# Auto-reload for `npm run backend` (not shipped).
+uvicorn[standard]>=0.35,<1
+ruff==0.16.8

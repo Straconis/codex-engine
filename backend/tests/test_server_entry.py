@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("pymupdf")
 
-import server_entry  # noqa: E402
+import server_entry
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.5", "::1", "localhost"])

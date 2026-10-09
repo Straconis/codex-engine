@@ -1,9 +1,13 @@
 #define MyAppName "Codex Engine"
-; Version is passed in by scripts/build-installer-inno.ps1 from package.json.
+; The version comes from package.json: scripts/build-installer-inno.ps1 passes it in.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.13"
+  #error Build the installer with "npm run installer:inno" (it passes /DMyAppVersion from package.json).
 #endif
-#define MyAppPublisher "Codex Engine"
+#define MyAppPublisher "Straconis"
+#define MyAppURL "https://github.com/Straconis/codex-engine"
+; Must match package.json build.appId (the app sets it too), so pinned shortcuts and the
+; running app share one taskbar button.
+#define MyAppUserModelID "com.codexengine.app"
 #define MyAppExeName "Codex Engine.exe"
 #define SourceDir "..\release\electron\win-unpacked"
 
@@ -12,14 +16,21 @@ AppId={{8BA77CE7-5079-4F72-90ED-7CB3BDBA9C0F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}/issues
+AppUpdatesURL={#MyAppURL}/releases
+VersionInfoVersion={#MyAppVersion}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\release\installer
 OutputBaseFilename=CodexEngineSetup-{#MyAppVersion}
 SetupIconFile=..\assets\icons-v2\codex-engine-v2.ico
-Compression=lzma
+Compression=lzma2/max
 SolidCompression=yes
+; Program Files needs admin rights; Electron 44 needs Windows 10 or later.
+PrivilegesRequired=admin
+MinVersion=10.0
 WizardStyle=modern
 ; The app is built for 64-bit x86 only (ARM64 Windows runs it under emulation).
 ArchitecturesAllowed=x64compatible
@@ -43,7 +54,7 @@ Type: filesandordirs; Name: "{app}\locales"; Check: IsUpgrade
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelID}"
 ; Directly in the group: Windows 10/11 Start menus don't show nested subfolders.
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 ; A second app in the group keeps Windows from collapsing the folder down to just
@@ -51,7 +62,7 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 ; The app opens the folder of whoever clicks it (an admin installing for someone else
 ; would otherwise point everyone at the admin's own folder).
 Name: "{group}\{#MyAppName} Data Folder"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--open-data-folder"; IconFilename: "{sys}\shell32.dll"; IconIndex: 3; Comment: "Your Codex Engine library, settings and logs"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelID}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

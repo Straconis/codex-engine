@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   api,
+  errorText,
+  type AIFormatLogEvent,
+  type AIFormatProgressEvent,
   type AIStatus,
   type BookAICheck,
   type DuplicateDetectedPayload,
@@ -15,13 +18,16 @@ import {
   type VersionInfo,
 } from "./api";
 import { highlightText, markedSnippet, queryPattern } from "./highlight";
-import AIProgressWindow, { type AIRun } from "./AIProgressWindow";
+import AIProgressWindow, { newAIRun, type AIRun } from "./AIProgressWindow";
 import ChangesView from "./ChangesView";
+import Dialog from "./Dialog";
+import { formatElapsed, percent, plural } from "./format";
 import Markdown from "./Markdown";
 import SettingsPanel from "./SettingsPanel";
-import appLogo from "../assets/codex-engine-logo-1024.png";
+// A 128 px copy of the app logo: the header shows it at 44 px.
+import appLogo from "./assets/codex-engine-logo-128.png";
 
-const FRONTEND_VERSION = import.meta.env.PACKAGE_VERSION ?? "dev";
+const FRONTEND_VERSION = import.meta.env.PACKAGE_VERSION;
 
 function pickPdfFile(): Promise<File | null> {
   return new Promise((resolve) => {
@@ -33,6 +39,7 @@ function pickPdfFile(): Promise<File | null> {
     input.click();
   });
 }
+
 const VIEW_LABELS: Record<ReaderView, string> = {
   edited: "Your edit",
   ai: "AI formatted",
@@ -62,6 +69,25 @@ function describeUpdate(update: UpdateCheckResult): string {
 }
 
 const SEARCH_LIMIT = 50; // the backend returns at most this many results
+
+// The text the reader shows (and "Edit page" starts from) for a text version. "changes" and a
+// version the page doesn't have fall back to the cleaned text.
+function shownText(page: PageView, view: ReaderView): string {
+  if (view === "edited" && page.edited_md != null) return page.edited_md;
+  if (view === "ai" && page.ai_md) return page.ai_md;
+  if (view === "raw" && page.raw_text) return page.raw_text;
+  return page.clean_md;
+}
+
+type BookRun = {
+  total: number;
+  done: number;
+  current: number | null; // page being reformatted; null once the run is over
+  ok: number[];
+  needsYou: number[];
+  failed: { page: number; message: string }[];
+  stopped: boolean;
+};
 
 const THEME_KEY = "codex-engine.theme";
 
@@ -95,7 +121,7 @@ export default function App() {
   const updateBusy = useRef(false); // a check or apply is in flight (state alone can't stop a fast double click)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
 
-  // Ingest modal state
+  // Import window state
   const [ingestOpen, setIngestOpen] = useState(false);
   const [ingestPath, setIngestPath] = useState("");
   const [ingestId, setIngestIdState] = useState<number | null>(null);
@@ -109,11 +135,10 @@ export default function App() {
   // Plain-language history of the current import (one line per step) and when it started.
   const [ingestLog, setIngestLog] = useState<{ at: number; message: string }[]>([]);
   const [ingestStarted, setIngestStarted] = useState<number | null>(null);
-  const [ingestNow, setIngestNow] = useState(Date.now());
+  const [ingestNow, setIngestNow] = useState(() => Date.now());
 
-  // Duplicate modal state
+  // The duplicate waiting for the user's choice (its window is open while this is set).
   const [dup, setDup] = useState<DuplicateDetectedPayload | null>(null);
-  const [dupOpen, setDupOpen] = useState(false);
 
   // Page reader state
   const [reader, setReader] = useState<{ sourceId: number; page: number } | null>(null);
@@ -122,32 +147,26 @@ export default function App() {
   const [readerError, setReaderError] = useState("");
   const [aiNotice, setAiNotice] = useState(""); // AI unavailable/rejected: informational, not an app error
   const [readerLoading, setReaderLoading] = useState(false);
-  // The page being AI formatted (null when idle) and its live "section n of total" progress.
-  // The current (or last) AI formatting run, shown in the progress window.
+  // The current (or last) AI formatting run, shown in the progress window (null: none to show).
   const [aiRun, setAiRun] = useState<AIRun | null>(null);
   const aiBusy = Boolean(aiRun && !aiRun.finished);
   // Sections the AI still couldn't format after its automatic retries: the user decides what next.
   const [aiDecision, setAiDecision] = useState<{ sourceId: number; page: number; pending: AIPending } | null>(null);
   // "Check AI pages" for one book, and the "Reformat all" run over its outdated pages.
   const [bookCheck, setBookCheck] = useState<{ sourceId: number; title: string; report: BookAICheck | null; error: string } | null>(null);
-  const [bookRun, setBookRun] = useState<{
-    total: number;
-    done: number;
-    current: number | null;
-    ok: number[];
-    needsYou: number[];
-    failed: { page: number; message: string }[];
-    stopped: boolean;
-  } | null>(null);
-  const bookStop = useRef(false);
-  // reformatBook runs across many renders; it reads the reader's current state through these.
-  const readerRef = useRef(reader);
-  readerRef.current = reader;
+  const [bookRun, setBookRun] = useState<BookRun | null>(null);
+  const bookStopRef = useRef(false); // set to stop "Reformat all" after the current page
   const bookRunning = Boolean(bookRun && bookRun.current !== null);
   // Manual edit in progress (the page text being edited), and whether it differs from where it started.
   const [editing, setEditing] = useState<{ text: string; original: string } | null>(null);
+  // reformatBook runs across many renders; it reads which page the reader shows, and whether
+  // an edit is open there, through these two refs (updated after every render).
+  const readerRef = useRef(reader);
   const editingRef = useRef(editing);
-  editingRef.current = editing;
+  useEffect(() => {
+    readerRef.current = reader;
+    editingRef.current = editing;
+  });
   const [savingEdit, setSavingEdit] = useState(false);
   // The search the current results came from: its terms are highlighted in the reader.
   const [searchedFor, setSearchedFor] = useState("");
@@ -168,10 +187,13 @@ export default function App() {
   // without tearing down and reconnecting every time a checkbox changes.
   const logToConsoleRef = useRef(logToConsole);
   const logToFileRef = useRef(logToFile);
-  logToConsoleRef.current = logToConsole;
-  logToFileRef.current = logToFile;
+  useEffect(() => {
+    logToConsoleRef.current = logToConsole;
+    logToFileRef.current = logToFile;
+  }, [logToConsole, logToFile]);
 
-  function uiLog(line: string) {
+  // Stable (reads the toggles through refs), so the event stream below connects once.
+  const uiLog = useCallback((line: string) => {
     const ts = new Date().toISOString();
     const msg = `[ui ${ts}] ${line}`;
     if (logToConsoleRef.current) {
@@ -182,26 +204,25 @@ export default function App() {
       // Written to <userData>/logs/ui.log by the Electron main process.
       window.codexEngine?.logToFile?.(msg);
     }
-  }
+  }, []);
 
-  async function refreshSources() {
+  const refreshSources = useCallback(async () => {
     try {
       uiLog("refresh_sources start");
       const rows = await api.listSources();
       setSources(rows);
       uiLog(`refresh_sources ok count=${rows.length}`);
-    } catch (e: any) {
-      uiLog(`refresh_sources failed ${String(e)}`);
-      setStatus(`Failed to load sources: ${String(e)}`);
+    } catch (e: unknown) {
+      uiLog(`refresh_sources failed ${errorText(e)}`);
+      setStatus(`Couldn't load the sources: ${errorText(e)}`);
     }
-  }
+  }, [uiLog]);
 
-  const enabledCount = useMemo(
-    () => sources.filter((s) => (s.enabled ?? 0) === 1).length,
-    [sources]
-  );
+  const enabledCount = useMemo(() => sources.filter((s) => s.enabled).length, [sources]);
 
-  const selectedCount = sources.length;
+  const refreshAiStatus = useCallback(() => {
+    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+  }, []);
 
   useEffect(() => {
     window.codexEngine?.setConsoleOpen(logToConsole);
@@ -217,8 +238,8 @@ export default function App() {
     refreshSources();
     api
       .getVersion()
-      .then((version) => setVersionInfo({ ...version, frontend_version: FRONTEND_VERSION }))
-      .catch((e: any) => setStatus(`Version check failed: ${String(e)}`));
+      .then(setVersionInfo)
+      .catch((e: unknown) => setStatus(`Version check failed: ${errorText(e)}`));
 
     const events = new EventSource(api.eventsUrl);
 
@@ -234,7 +255,14 @@ export default function App() {
       setProgress(p);
       setIngestLog((log) => {
         // One line per step: per-page updates within a step replace the step's line.
-        const message = p.error ? `Failed: ${p.error}` : p.done ? `Finished: ${p.message}` : p.message;
+        // A cancelled import ends with stage "cancelled", done and no error; its message says so.
+        const message = p.error
+          ? `Failed: ${p.error}`
+          : p.stage === "cancelled"
+          ? p.message
+          : p.done
+          ? `Finished: ${p.message}`
+          : p.message;
         const last = log[log.length - 1];
         const sameStep = last && !p.done && !p.error && last.message.split(/\d/)[0] === message.split(/\d/)[0];
         const entry = { at: Date.now(), message };
@@ -249,9 +277,8 @@ export default function App() {
       const payload = JSON.parse((event as MessageEvent).data) as DuplicateDetectedPayload;
       uiLog(`duplicate_detected for ingest_id=${payload.ingest_id} existing_id=${payload.existing_id}`);
       setDup(payload);
-      setDupOpen(true);
       setIngestOpen(true);
-      setStatus("Duplicate detected - choose what to do.");
+      setStatus("This PDF is already in the library. Choose what to do.");
     });
 
     events.addEventListener("model_pull", (event) => {
@@ -261,16 +288,7 @@ export default function App() {
     });
 
     events.addEventListener("ai_format_progress", (event) => {
-      const p = JSON.parse((event as MessageEvent).data) as {
-        source_id: number;
-        page_num: number;
-        done: number;
-        total: number;
-        attempt: number;
-        max_attempts: number;
-        written: number;
-        expected: number;
-      };
+      const p = JSON.parse((event as MessageEvent).data) as AIFormatProgressEvent;
       setAiRun((run) =>
         run && !run.finished && run.sourceId === p.source_id && run.page === p.page_num
           ? { ...run, done: p.done, total: p.total, attempt: p.attempt, maxAttempts: p.max_attempts, written: p.written, expected: p.expected }
@@ -279,7 +297,7 @@ export default function App() {
     });
 
     events.addEventListener("ai_format_log", (event) => {
-      const p = JSON.parse((event as MessageEvent).data) as { source_id: number; page_num: number; message: string; at: number };
+      const p = JSON.parse((event as MessageEvent).data) as AIFormatLogEvent;
       setAiRun((run) =>
         run && run.sourceId === p.source_id && run.page === p.page_num
           ? { ...run, log: [...run.log, { at: p.at * 1000, message: p.message }].slice(-200) }
@@ -299,29 +317,31 @@ export default function App() {
     return () => {
       events.close();
     };
-  }, []);
+  }, [refreshSources, uiLog]); // both stable: connects once
 
   async function toggleSourceEnabled(sourceId: number, enabled: boolean) {
     try {
       uiLog(`set_source_enabled id=${sourceId} enabled=${enabled}`);
       await api.setSourceEnabled(sourceId, enabled);
+      // A book that's off isn't searched: its results leave the current list too.
+      if (!enabled) setResults((r) => r.filter((x) => x.source_id !== sourceId));
       await refreshSources();
-    } catch (e: any) {
-      uiLog(`set_source_enabled failed id=${sourceId} ${String(e)}`);
-      setStatus(`Failed to update source: ${String(e)}`);
+    } catch (e: unknown) {
+      uiLog(`set_source_enabled failed id=${sourceId} ${errorText(e)}`);
+      setStatus(`Couldn't update the source: ${errorText(e)}`);
     }
   }
 
-  async function deleteSource(sourceId: number) {
-    if (!confirm("Delete this source and all its chunks?")) return;
+  async function deleteSource(sourceId: number, title: string) {
+    if (!confirm(`Delete "${title}" from the library, with its pages, AI versions and your edits?`)) return;
     try {
       uiLog(`delete_source id=${sourceId}`);
       await api.deleteSource(sourceId);
       await refreshSources();
       setResults((r) => r.filter((x) => x.source_id !== sourceId));
-    } catch (e: any) {
-      uiLog(`delete_source failed id=${sourceId} ${String(e)}`);
-      setStatus(`Failed to delete source: ${String(e)}`);
+    } catch (e: unknown) {
+      uiLog(`delete_source failed id=${sourceId} ${errorText(e)}`);
+      setStatus(`Couldn't delete the source: ${errorText(e)}`);
     }
   }
 
@@ -341,14 +361,14 @@ export default function App() {
         rows.length >= SEARCH_LIMIT
           ? `Showing the first ${SEARCH_LIMIT} results (best matches first). Add more words to narrow the search.`
           : rows.length
-          ? `Found ${rows.length} result(s).`
+          ? `Found ${plural(rows.length, "result")}.`
           : "No results."
       );
       uiLog(`search ok query="${q}" results=${rows.length}`);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (requestId !== searchRequest.current) return;
-      uiLog(`search failed query="${q}" ${String(e)}`);
-      setStatus(`Search failed: ${String(e)}`);
+      uiLog(`search failed query="${q}" ${errorText(e)}`);
+      setStatus(`Search failed: ${errorText(e)}`);
     }
   }
 
@@ -360,7 +380,7 @@ export default function App() {
     try {
       uiLog("update_check start");
       setCheckingUpdates(true);
-      setUpdateStatus("Checking GitHub for updates...");
+      setUpdateStatus("Checking GitHub for updates…");
       const update = await api.checkForUpdate();
       uiLog(`update_check result status=${update.status} current=${update.current_version} latest=${update.latest_version}`);
 
@@ -378,7 +398,7 @@ export default function App() {
       }
 
       applying = true;
-      setUpdateStatus(`Downloading Codex Engine ${update.latest_version}...`);
+      setUpdateStatus(`Downloading Codex Engine ${update.latest_version}…`);
       // The backend re-checks GitHub; it reports "updater_launched" only when the updater really started.
       const result = await api.applyUpdate();
       uiLog(`update_apply result status=${result.status} latest=${result.latest_version}`);
@@ -389,9 +409,9 @@ export default function App() {
       launched = true;
       setUpdateStatus(describeUpdate(result));
       setTimeout(() => window.close(), 750);
-    } catch (e: any) {
-      uiLog(`${applying ? "update_apply" : "update_check"} failed ${String(e)}`);
-      setUpdateStatus(`${applying ? "Update failed" : "Update check failed"}: ${String(e).replace(/^Error: /, "")}`);
+    } catch (e: unknown) {
+      uiLog(`${applying ? "update_apply" : "update_check"} failed ${errorText(e)}`);
+      setUpdateStatus(`${applying ? "Update failed" : "Update check failed"}: ${errorText(e)}`);
     } finally {
       // Once the updater is running the app is closing: keep the button disabled.
       if (!launched) {
@@ -405,9 +425,9 @@ export default function App() {
     try {
       uiLog(`open_pdf path="${path}" page=${page}`);
       await api.openPdfAtLocation(path, page);
-    } catch (e: any) {
-      uiLog(`open_pdf failed path="${path}" page=${page} ${String(e)}`);
-      setReaderError(`Open failed: ${String(e)}`);
+    } catch (e: unknown) {
+      uiLog(`open_pdf failed path="${path}" page=${page} ${errorText(e)}`);
+      setReaderError(`Couldn't open the PDF: ${errorText(e)}`);
     }
   }
 
@@ -424,11 +444,11 @@ export default function App() {
       if (requestId !== readerRequest.current) return;
       setReaderPage(data);
       setReaderView(data.best);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (requestId !== readerRequest.current) return;
-      uiLog(`reader_load failed source=${sourceId} page=${page} ${String(e)}`);
+      uiLog(`reader_load failed source=${sourceId} page=${page} ${errorText(e)}`);
       setReaderPage(null);
-      setReaderError(String(e));
+      setReaderError(errorText(e));
     } finally {
       if (requestId === readerRequest.current) setReaderLoading(false);
     }
@@ -437,7 +457,7 @@ export default function App() {
   function openReader(r: SearchRow) {
     setReaderPage(null);
     loadReaderPage(r.source_id, r.page_num);
-    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+    refreshAiStatus();
   }
 
   // Unsaved manual edits are never thrown away silently.
@@ -462,6 +482,14 @@ export default function App() {
 
   // decision: undefined = the button (first run / regenerate), "retry" = keep trying the failed
   // sections, "clean" = keep the cleaned text for them.
+  // Shows a new run in the progress window; the returned function records how it ended (if
+  // the window still shows that run).
+  function startAiRun(sourceId: number, page: number, title: string) {
+    setAiRun(newAIRun(sourceId, page, title));
+    return (kind: NonNullable<AIRun["finished"]>["kind"], message: string) =>
+      setAiRun((run) => (run && run.sourceId === sourceId && run.page === page ? { ...run, finished: { kind, message } } : run));
+  }
+
   async function aiFormatReaderPage(decision?: "retry" | "clean") {
     if (!reader) return;
     const { sourceId, page } = reader;
@@ -469,30 +497,19 @@ export default function App() {
     // The button on a page that already has current AI output means "regenerate": skip the cache.
     // A follow-up decision must not: the sections that already passed are reused from the cache.
     const force = !decision && Boolean(readerPage?.ai_md && !readerPage.ai_stale);
-    setAiRun({
-      sourceId,
-      page,
-      title: readerPage?.title ?? "",
-      startedAt: Date.now(),
-      done: 0,
-      total: 0,
-      attempt: 0,
-      maxAttempts: 0,
-      written: 0,
-      expected: 0,
-      log: [],
-    });
-    const finish = (kind: NonNullable<AIRun["finished"]>["kind"], message: string) =>
-      setAiRun((run) => (run && run.sourceId === sourceId && run.page === page ? { ...run, finished: { kind, message } } : run));
+    const finish = startAiRun(sourceId, page, readerPage?.title ?? "");
     setAiDecision(null);
     setAiNotice("");
     try {
       uiLog(`ai_format start source=${sourceId} page=${page} force=${force} decision=${decision ?? ""}`);
       const data = await api.aiFormatPage(sourceId, page, { model: aiStatus?.model, force, useCleanForFailed: decision === "clean" });
       uiLog(`ai_format done source=${sourceId} page=${page} model=${data.ai_model} pending=${data.pending?.failed.length ?? 0}`);
-      if (data.pending) setAiDecision({ sourceId, page, pending: data.pending });
       if (data.pending) {
-        finish("decision", `Couldn't format ${data.pending.failed.length} of ${data.pending.sections} part(s) without changing the text. Your choice is waiting on the page.`);
+        setAiDecision({ sourceId, page, pending: data.pending });
+        finish(
+          "decision",
+          `Couldn't format ${data.pending.failed.length} of ${plural(data.pending.sections, "part")} without changing the text. Your choice is waiting on the page.`
+        );
       } else if (data.ai_error) {
         finish(data.ai_md ? "partial" : "error", data.ai_error);
       } else {
@@ -517,26 +534,26 @@ export default function App() {
       setReaderPage(data);
       setReaderView(data.best);
       if (data.ai_error && !data.pending) setAiNotice(data.ai_error);
-    } catch (e: any) {
+    } catch (e: unknown) {
       // 409 = cancelled by the user; 503 = Ollama not running / no model. The reader keeps working.
-      const message = String(e).replace(/^Error: /, "");
+      const message = errorText(e);
       uiLog(`ai_format failed source=${sourceId} page=${page} ${message}`);
       finish(/^Cancelled/.test(message) ? "cancelled" : "error", message);
       if (!/^Cancelled/.test(message)) setAiNotice(message);
-      api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+      refreshAiStatus();
     }
   }
 
   async function checkBookAI(sourceId: number, title: string) {
     setBookCheck({ sourceId, title, report: null, error: "" });
     setBookRun(null);
-    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+    refreshAiStatus();
     try {
       uiLog(`book_ai_check source=${sourceId}`);
       const report = await api.checkBookAI(sourceId);
       setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, report } : c));
-    } catch (e: any) {
-      setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, error: String(e).replace(/^Error: /, "") } : c));
+    } catch (e: unknown) {
+      setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, error: errorText(e) } : c));
     }
   }
 
@@ -547,14 +564,12 @@ export default function App() {
     if (!bookCheck?.report || aiBusy) return;
     const { sourceId, title } = bookCheck;
     const pages = bookCheck.report.outdated.map((p) => p.page_num);
-    bookStop.current = false;
+    bookStopRef.current = false;
     setBookRun({ total: pages.length, done: 0, current: null, ok: [], needsYou: [], failed: [], stopped: false });
     for (const page of pages) {
-      if (bookStop.current) break;
+      if (bookStopRef.current) break;
       setBookRun((r) => r && { ...r, current: page });
-      setAiRun({ sourceId, page, title, startedAt: Date.now(), done: 0, total: 0, attempt: 0, maxAttempts: 0, written: 0, expected: 0, log: [] });
-      const finish = (kind: NonNullable<AIRun["finished"]>["kind"], message: string) =>
-        setAiRun((run) => (run && run.sourceId === sourceId && run.page === page ? { ...run, finished: { kind, message } } : run));
+      const finish = startAiRun(sourceId, page, title);
       let outcome: "ok" | "needsYou" | "failed" = "failed";
       let message = "";
       try {
@@ -570,10 +585,10 @@ export default function App() {
           outcome = "ok";
           finish("ok", `Page ${page} reformatted and checked.`);
         }
-      } catch (e: any) {
-        message = String(e).replace(/^Error: /, "");
+      } catch (e: unknown) {
+        message = errorText(e);
         finish(/^Cancelled/.test(message) ? "cancelled" : "error", message);
-        if (/^Cancelled/.test(message) || /unavailable/i.test(message)) bookStop.current = true; // stop, or no AI to continue with
+        if (/^Cancelled/.test(message) || /unavailable/i.test(message)) bookStopRef.current = true; // stop, or no AI to continue with
       }
       setBookRun(
         (r) =>
@@ -588,7 +603,7 @@ export default function App() {
       const open = readerRef.current;
       if (open && open.sourceId === sourceId && open.page === page && !editingRef.current) loadReaderPage(sourceId, page);
     }
-    setBookRun((r) => r && { ...r, current: null, stopped: bookStop.current });
+    setBookRun((r) => r && { ...r, current: null, stopped: bookStopRef.current });
     try {
       const report = await api.checkBookAI(sourceId);
       setBookCheck((c) => (c && c.sourceId === sourceId ? { ...c, report } : c));
@@ -598,7 +613,7 @@ export default function App() {
   }
 
   function stopBookReformat() {
-    bookStop.current = true;
+    bookStopRef.current = true;
     cancelAiFormat();
   }
 
@@ -608,24 +623,25 @@ export default function App() {
     setBookCheck(null); // the reader opens underneath this window
     setReaderPage(null);
     loadReaderPage(sourceId, page);
-    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
+    refreshAiStatus();
   }
 
   async function cancelAiFormat() {
     if (!aiRun || aiRun.finished) return;
     try {
       await api.cancelAiFormat(aiRun.sourceId, aiRun.page);
-    } catch (e: any) {
-      uiLog(`ai_format cancel failed ${String(e)}`);
+    } catch (e: unknown) {
+      uiLog(`ai_format cancel failed ${errorText(e)}`);
     }
   }
 
   // A successful run's window closes itself after a few seconds; anything else stays until closed.
+  const aiRunEnd = aiRun?.finished?.kind;
   useEffect(() => {
-    if (aiRun?.finished?.kind !== "ok") return;
+    if (aiRunEnd !== "ok") return;
     const timer = window.setTimeout(() => setAiRun((run) => (run?.finished?.kind === "ok" ? null : run)), 6000);
     return () => window.clearTimeout(timer);
-  }, [aiRun?.finished?.kind]);
+  }, [aiRunEnd]);
 
   // The page shown is the page the reader points at (not a previous page still on screen while loading).
   function readerShowsItsPage(): boolean {
@@ -648,9 +664,9 @@ export default function App() {
       setReaderView("edited");
       setEditing(null);
       setAiDecision(null);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (requestId !== readerRequest.current) return;
-      setReaderError(`Couldn't save your edit: ${String(e).replace(/^Error: /, "")}`);
+      setReaderError(`Couldn't save your edit: ${errorText(e)}`);
     } finally {
       setSavingEdit(false);
     }
@@ -668,51 +684,35 @@ export default function App() {
       if (requestId !== readerRequest.current) return;
       setReaderPage(data);
       setReaderView(data.best);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (requestId !== readerRequest.current) return;
-      setReaderError(`Couldn't revert: ${String(e).replace(/^Error: /, "")}`);
+      setReaderError(`Couldn't revert: ${errorText(e)}`);
     }
   }
 
   function startEdit(text?: string) {
     if (!readerPage || !readerShowsItsPage()) return;
-    const current =
-      text ??
-      (readerView === "edited" && readerPage.edited_md != null
-        ? readerPage.edited_md
-        : readerView === "ai" && readerPage.ai_md
-        ? readerPage.ai_md
-        : readerView === "raw" && readerPage.raw_text
-        ? readerPage.raw_text
-        : readerPage.clean_md);
+    const current = text ?? shownText(readerPage, readerView);
     setEditing({ text: current, original: current });
   }
 
   // Jump to the first search match whenever a page (or text version, or its text) is shown.
   // Keyed on whether an edit is open, not on its text: typing must not scroll the reader.
   const isEditing = editing !== null;
+  const shownPage = readerPage ? `${readerPage.source_id}:${readerPage.page_num}` : null;
+  const readerText = readerPage ? shownText(readerPage, readerView) : null;
   useEffect(() => {
     const body = readerBodyRef.current;
-    if (!body || !readerPage || isEditing) return;
+    if (!body || readerText === null || isEditing) return;
     const marks = body.querySelectorAll("mark");
     setMatchCount(marks.length);
     if (marks.length) marks[0].scrollIntoView({ block: "center" });
     else body.scrollTop = 0;
-  }, [
-    readerPage?.source_id,
-    readerPage?.page_num,
-    readerPage?.edited_md,
-    readerPage?.clean_md,
-    readerPage?.ai_md,
-    readerPage?.raw_text,
-    readerView,
-    isEditing,
-    highlight,
-  ]);
+  }, [shownPage, readerText, readerView, isEditing, highlight]);
 
-  // Reader shortcuts, only while the reader is the top-most window: Settings, the ingest, book
-  // check and duplicate windows all open above it.
-  const readerOnTop = Boolean(reader) && !settingsOpen && !ingestOpen && !bookCheck && !(dupOpen && dup);
+  // Page-turning keys, only while the reader is the top-most window: Settings, the import, book
+  // check and duplicate windows all open above it. (Escape is handled by Dialog.)
+  const readerOnTop = Boolean(reader) && !settingsOpen && !ingestOpen && !bookCheck && !dup;
   useEffect(() => {
     if (!readerOnTop) return;
     const onKey = (e: KeyboardEvent) => {
@@ -723,90 +723,45 @@ export default function App() {
         (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.tagName === "SELECT" || target.isContentEditable)
       )
         return;
-      if (e.key === "Escape") closeReader();
-      else if (e.key === "ArrowLeft") turnReaderPage(-1);
+      if (e.key === "ArrowLeft") turnReaderPage(-1);
       else if (e.key === "ArrowRight") turnReaderPage(1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  function resetIngestLog() {
-    setIngestLog([]);
-    setIngestStarted(Date.now());
-  }
-
+  const ingestRunning = Boolean(progress && !progress.done);
+  const ingestPercent = progress ? percent(progress.current, progress.total) : 0;
   useEffect(() => {
-    if (!ingestOpen || !progress || progress.done) return;
+    if (!ingestOpen || !ingestRunning) return;
     const timer = window.setInterval(() => setIngestNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [ingestOpen, progress?.done]);
+  }, [ingestOpen, ingestRunning]);
 
-  async function startIngestWithPath(path: string) {
-    resetIngestLog();
+  // Starts an import (by path, or by uploading a file) and shows it in the import window.
+  // `starting` is shown until the backend reports; `failed` names what went wrong.
+  async function startIngest(
+    begin: () => Promise<{ id: number; path?: string }>,
+    starting: string,
+    failed: string,
+    logName: string
+  ) {
+    setIngestLog([]);
+    setIngestStarted(Date.now());
+    setIngestId(null);
+    setIngestOpen(true);
+    setStatus(starting);
+    setProgress({ id: -1, stage: "start", message: starting, current: 0, total: 1, done: false, error: null });
     try {
-      setStatus("Starting ingest…");
-      setIngestId(null);
-      setProgress({
-        id: -1,
-        stage: "start",
-        message: "Starting…",
-        current: 0,
-        total: 1,
-        done: false,
-        error: null,
-      });
-
-      const { id } = await api.startIngest(path);
+      const { id, path } = await begin();
       setIngestId(id);
-      setStatus(`Ingest queued (#${id}).`);
-      uiLog(`start_ingest_pdf -> ${id}`);
-    } catch (e: any) {
-      setStatus(`Ingest start failed: ${String(e)}`);
-      setProgress({
-        id: -1,
-        stage: "error",
-        message: "Ingest failed to start",
-        current: 0,
-        total: 0,
-        done: true,
-        error: String(e),
-      });
-    }
-  }
-
-  async function startIngestWithFile(file: File) {
-    resetIngestLog();
-    try {
-      setStatus("Uploading PDF...");
-      setIngestId(null);
-      setIngestPath(file.name);
-      setIngestOpen(true);
-      setProgress({
-        id: -1,
-        stage: "upload",
-        message: "Uploading...",
-        current: 0,
-        total: 1,
-        done: false,
-        error: null,
-      });
-      const { id, path } = await api.uploadAndIngest(file);
-      setIngestId(id);
-      setIngestPath(path);
-      setStatus(`Ingest queued (#${id}).`);
-      uiLog(`upload_and_ingest -> ${id}`);
-    } catch (e: any) {
-      setStatus(`Upload failed: ${String(e)}`);
-      setProgress({
-        id: -1,
-        stage: "error",
-        message: "Upload failed",
-        current: 0,
-        total: 0,
-        done: true,
-        error: String(e),
-      });
+      if (path) setIngestPath(path);
+      setStatus(`Import queued (#${id}).`);
+      uiLog(`${logName} -> ${id}`);
+    } catch (e: unknown) {
+      const message = errorText(e);
+      setStatus(`${failed}: ${message}`);
+      setProgress({ id: -1, stage: "error", message: failed, current: 0, total: 0, done: true, error: message });
     }
   }
 
@@ -814,22 +769,23 @@ export default function App() {
     try {
       const file = await pickPdfFile();
       if (!file) return;
-      await startIngestWithFile(file);
-    } catch (e: any) {
-      setStatus(`File picker failed: ${String(e)}`);
+      setIngestPath(file.name);
+      await startIngest(() => api.uploadAndIngest(file), "Uploading the PDF…", "Upload failed", "upload_and_ingest");
+    } catch (e: unknown) {
+      setStatus(`Couldn't open the file picker: ${errorText(e)}`);
     }
   }
 
   async function cancelIngest() {
     if (ingestId == null) {
-      setStatus("Cancel failed: no active ingest id yet.");
+      setStatus("Can't cancel yet: the import hasn't started.");
       return;
     }
     try {
       await api.cancelIngest(ingestId);
       setStatus("Cancel requested.");
-    } catch (e: any) {
-      setStatus(`Cancel failed: ${String(e)}`);
+    } catch (e: unknown) {
+      setStatus(`Cancel failed: ${errorText(e)}`);
     }
   }
 
@@ -837,303 +793,31 @@ export default function App() {
     if (!dup) return;
     try {
       await api.resolveDuplicate(dup.ingest_id, action);
-      setDupOpen(false);
+      setDup(null);
       setStatus(
         action === "discard"
-          ? "Duplicate: keeping original."
+          ? "Duplicate: kept the existing copy."
           : action === "replace"
-          ? "Duplicate: replacing original (rebuild)…"
-          : "Duplicate: ingesting as a new copy…"
+          ? "Duplicate: replacing the existing copy (rebuilding)…"
+          : "Duplicate: adding it as a new copy…"
       );
-    } catch (e: any) {
-      setStatus(`Duplicate resolve failed: ${String(e)}`);
+    } catch (e: unknown) {
+      setStatus(`Couldn't resolve the duplicate: ${errorText(e)}`);
     }
   }
 
-  // Basic layout: two-column that scales full window, with panels.
+  const sourcesListId = useId();
+
+  // Layout: a top bar, then two panels (sources, search results) that fill the window.
   return (
     <div className={dark ? "app dark" : "app light"}>
-      <style>{`
-        :root {
-          --bg: #f5f6f8;
-          --fg: #121417;
-          --muted: #5a606b;
-          --panel: #ffffff;
-          --border: rgba(0,0,0,0.12);
-          --shadow: 0 6px 22px rgba(0,0,0,0.10);
-          --accent: #3b82f6;
-          --danger: #ef4444;
-          --ok: #16a34a;
-        }
-        .dark {
-          --bg: #0b0f14;
-          --fg: #e7eef7;
-          --muted: #93a3b5;
-          --panel: #0f1622;
-          --border: rgba(255,255,255,0.10);
-          --shadow: 0 10px 28px rgba(0,0,0,0.40);
-          --accent: #60a5fa;
-          --danger: #f87171;
-          --ok: #34d399;
-        }
-
-        html, body, #root { height: 100%; margin: 0; }
-        .app {
-          height: 100%;
-          display: flex;
-          flex-direction: column;
-          background: var(--bg);
-          color: var(--fg);
-          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-        }
-
-        .topbar {
-          padding: 14px 22px;
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-        }
-
-        .brand {
-          display: flex;
-          align-items: center;
-          gap: 14px;
-          min-width: 0;
-        }
-        .brandLogo {
-          width: 44px;
-          height: 44px;
-          object-fit: contain;
-          flex: 0 0 auto;
-          filter: drop-shadow(0 5px 14px rgba(0,0,0,0.30));
-        }
-        .title { min-width: 0; }
-        .title h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; line-height: 1.1; white-space: nowrap; }
-        .title .sub { margin-top: 3px; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        mark { background: rgba(250, 204, 21, 0.35); color: inherit; border-radius: 3px; padding: 0 1px; }
-        .light mark { background: rgba(250, 204, 21, 0.55); }
-
-        .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
-        .btn {
-          border: 1px solid var(--border);
-          background: var(--panel);
-          color: var(--fg);
-          padding: 9px 12px;
-          border-radius: 10px;
-          cursor: pointer;
-          box-shadow: none;
-        }
-        .btn:hover { border-color: rgba(255,255,255,0.20); }
-        .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-        .btn.primary { background: var(--accent); border-color: transparent; color: #0b0f14; font-weight: 600; }
-        .btn.danger { background: transparent; border-color: rgba(239,68,68,0.55); color: var(--danger); }
-        .btn.small { padding: 6px 10px; border-radius: 9px; font-size: 12px; }
-        .toggle { display:flex; align-items:center; gap:8px; color: var(--muted); font-size: 12px; }
-
-        .content {
-          flex: 1;
-          padding: 0 22px 22px;
-          display: grid;
-          grid-template-columns: minmax(240px, 320px) 1fr;
-          gap: 16px;
-          min-height: 0; /* important for overflow children */
-        }
-
-        .panel {
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 16px;
-          box-shadow: var(--shadow);
-          min-height: 0;
-          display: flex;
-          flex-direction: column;
-        }
-        .panelHeader {
-          padding: 12px 14px;
-          border-bottom: 1px solid var(--border);
-          display:flex;
-          align-items:center;
-          justify-content: space-between;
-          gap: 8px;
-        }
-        .panelHeader h2 { margin:0; font-size: 14px; letter-spacing: 0.02em; text-transform: uppercase; color: var(--muted); }
-        .panelBody { padding: 12px 14px; overflow: auto; min-height: 0; }
-
-        .sourceCard {
-          border: 1px solid var(--border);
-          border-radius: 14px;
-          padding: 12px;
-          margin-bottom: 10px;
-          background: rgba(255,255,255,0.02);
-        }
-        .sourceTitle { font-weight: 700; margin: 0 0 4px 0; }
-        .sourcePath { color: var(--muted); font-size: 12px; margin: 0 0 8px 0; }
-        .sourceMeta { color: var(--muted); font-size: 12px; display:flex; justify-content: space-between; gap:8px; }
-        .row { display:flex; align-items:center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-        .chk { display:flex; align-items:center; gap: 8px; font-size: 13px; }
-
-        .searchBar {
-          display:flex; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border);
-        }
-        .input {
-          flex: 1;
-          border: 1px solid var(--border);
-          background: rgba(255,255,255,0.03);
-          color: var(--fg);
-          padding: 10px 12px;
-          border-radius: 12px;
-          outline: none;
-        }
-        .input::placeholder { color: rgba(147,163,181,0.8); }
-
-        .results { padding: 12px 14px; overflow: auto; min-height: 0; }
-        .resultCard {
-          border: 1px solid var(--border);
-          border-radius: 14px;
-          padding: 12px;
-          margin-bottom: 10px;
-          cursor: pointer;
-          background: rgba(255,255,255,0.02);
-        }
-        .resultCard:hover { border-color: rgba(96,165,250,0.55); }
-        .resultTop { display:flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-        .resultHeading { font-weight: 800; }
-        .resultSrc { color: var(--muted); font-weight: 600; font-size: 13px; }
-        .resultMeta { color: var(--muted); font-size: 12px; margin-top: 4px; }
-        .resultSnippet { margin-top: 8px; color: var(--fg); opacity: 0.92; }
-
-        .status {
-          padding: 10px 22px 0;
-          color: var(--muted);
-          font-size: 12px;
-          min-height: 18px;
-        }
-
-        /* modal */
-        .overlay {
-          position: fixed;
-          inset: 0;
-          background: rgba(0,0,0,0.55);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 20px;
-          z-index: 50;
-        }
-        .modal {
-          width: min(820px, 96vw);
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 18px;
-          box-shadow: var(--shadow);
-          overflow: hidden;
-        }
-        .modalHeader {
-          padding: 14px 16px;
-          border-bottom: 1px solid var(--border);
-          display:flex;
-          align-items:center;
-          justify-content: space-between;
-          gap: 10px;
-        }
-        .modalHeader h3 { margin: 0; font-size: 16px; }
-        .modalBody { padding: 14px 16px; }
-        .modalActions { display:flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; margin-top: 12px; }
-
-        .progressWrap { margin-top: 10px; }
-        .barOuter { height: 10px; border-radius: 999px; background: rgba(255,255,255,0.08); border:1px solid var(--border); overflow: hidden; }
-        .barInner { height: 100%; background: var(--accent); width: 0%; border-radius: 999px; transition: width 140ms linear; }
-
-        /* page reader */
-        .reader { width: min(980px, 96vw); height: min(88vh, 1100px); display: flex; flex-direction: column; }
-        .readerTitle { min-width: 0; }
-        .readerTitle h3 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .readerSub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-        .readerBar { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .readerBar .spacer { flex: 1; }
-        .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
-        .seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 10px; font-size: 12px; cursor: pointer; }
-        .seg button.on { background: var(--accent); color: #0b0f14; font-weight: 600; }
-        .seg button:disabled { opacity: 0.45; cursor: not-allowed; }
-        .readerBody { flex: 1; overflow: auto; padding: 18px 28px 28px; min-height: 0; }
-        .readerNote { color: var(--muted); font-size: 12px; }
-        .readerError { color: var(--danger); font-size: 13px; margin-bottom: 10px; white-space: pre-wrap; }
-        .aiWindow { position: fixed; right: 18px; bottom: 18px; width: min(440px, calc(100vw - 36px)); z-index: 60; background: var(--panel); border: 1px solid var(--accent); border-radius: 14px; box-shadow: var(--shadow); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
-        .aiWindow.done-ok { border-color: var(--ok); }
-        .aiWindow.done-error, .aiWindow.done-cancelled { border-color: var(--border); }
-        .aiWindowHeader { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-        .aiWindowTitle { display: flex; flex-direction: column; min-width: 0; }
-        .aiWindowTitle .hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .aiWindowStatus { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
-        .aiWindowLog { margin: 0; padding: 8px 10px; list-style: none; max-height: 150px; overflow: auto; border-radius: 8px; background: rgba(127,127,127,0.08); font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
-        .aiWindowActions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-        .aiWindowActions .hint { flex: 1; }
-        .barInner.indeterminate { animation: aiPulse 1.4s ease-in-out infinite; }
-        @keyframes aiPulse { 0% { margin-left: 0; } 50% { margin-left: 70%; } 100% { margin-left: 0; } }
-        .changesView { max-width: 90ch; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
-        .changesSummary { font-size: 13px; display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
-        .changesText { white-space: pre-wrap; font: 13px/1.6 ui-monospace, Consolas, monospace; margin: 0; }
-        .changesView del, .changesSummary del { background: rgba(239, 68, 68, 0.22); text-decoration: line-through; border-radius: 3px; }
-        .changesView ins, .changesSummary ins { background: rgba(52, 211, 153, 0.25); text-decoration: none; border-radius: 3px; }
-        .invisibleChar { font-size: 10px; padding: 0 3px; margin: 0 1px; border: 1px dashed var(--muted); border-radius: 4px; color: var(--muted); }
-        .decision { max-width: 78ch; margin: 0 auto 14px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 12px; font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
-        .decisionActions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-        .editor { max-width: 90ch; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; height: 100%; }
-        .editArea { flex: 1; min-height: 50vh; width: 100%; box-sizing: border-box; resize: vertical; padding: 12px; border-radius: 10px; border: 1px solid var(--border); background: rgba(127,127,127,0.06); color: var(--fg); font: 13px/1.5 ui-monospace, Consolas, monospace; }
-        .aiNotice { color: var(--muted); font-size: 12px; margin: 0 auto 12px; max-width: 78ch; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; }
-        .rawText { white-space: pre-wrap; font-size: 13px; line-height: 1.5; max-width: 78ch; margin: 0 auto; font-family: ui-monospace, Consolas, monospace; }
-        /* settings */
-        .settings { width: min(720px, 96vw); max-height: 92vh; display: flex; flex-direction: column; }
-        .settingsBody { overflow: auto; display: flex; flex-direction: column; gap: 12px; }
-        .settingsGroup { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px 12px; margin: 0; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-        .settingsGroup:disabled { opacity: 0.5; }
-        .settingsGroup legend { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; padding: 0 6px; }
-        .settingsGroup .row { flex-wrap: nowrap; }
-        .field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
-        .field.narrow .input { max-width: 120px; }
-        .radio { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-        .hint { color: var(--muted); font-size: 12px; line-height: 1.4; }
-        .aiState { font-size: 13px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); }
-        .aiState.state-running, .aiState.state-external { border-color: var(--ok); }
-        .aiState.state-error, .aiState.state-not_installed { border-color: var(--danger); }
-        .settingsPath { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; align-self: center; }
-        .pullProgress { margin-top: 4px; display: flex; flex-direction: column; gap: 4px; }
-        select.input { flex: initial; }
-        .linkBtn { border: 0; background: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; text-decoration: underline; }
-
-        .md blockquote { margin: 0 0 0.85em; padding: 2px 0 2px 14px; border-left: 3px solid var(--border); color: var(--muted); }
-
-        .md { max-width: 78ch; margin: 0 auto; font-size: 15px; line-height: 1.6; }
-        .md h2, .md h3, .md h4, .md h5, .md h6 { line-height: 1.25; margin: 1.3em 0 0.5em; }
-        .md h2 { font-size: 24px; } .md h3 { font-size: 19px; } .md h4 { font-size: 16px; } .md h5, .md h6 { font-size: 15px; }
-        .md > :first-child { margin-top: 0; }
-        .md p { margin: 0 0 0.85em; }
-        .md ul, .md ol { margin: 0 0 0.85em; padding-left: 1.4em; }
-        .md li { margin: 0.2em 0; }
-        .md code { font-size: 0.92em; padding: 1px 4px; border-radius: 4px; background: rgba(127,127,127,0.15); }
-        .md hr { border: 0; border-top: 1px solid var(--border); margin: 1.2em 0; }
-        .mdTableWrap { overflow-x: auto; margin: 0 0 1em; }
-        .md table { border-collapse: collapse; font-size: 14px; }
-        .md th, .md td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; vertical-align: top; }
-        .md th { background: rgba(127,127,127,0.10); }
-        .mdEmpty { color: var(--muted); font-style: italic; text-align: center; margin-top: 40px; }
-
-        /* The desktop window is at least 900px wide, so the two columns always fit there;
-           only much narrower (browser) windows stack the panels. */
-        @media (max-width: 720px) {
-          .content { grid-template-columns: 1fr; }
-          .readerBody { padding: 14px 16px 20px; }
-        }
-      `}</style>
-
       <div className="topbar">
         <div className="brand">
-          <img className="brandLogo" src={appLogo} alt="" aria-hidden="true" />
+          <img className="brandLogo" src={appLogo} alt="" />
           <div className="title">
             <h1>Codex Engine</h1>
             <div className="sub">
-              Rulebook library (local) • Active sources: {enabledCount}/{selectedCount}
+              Rulebook library (local) · Active sources: {enabledCount}/{sources.length}
             </div>
           </div>
         </div>
@@ -1141,7 +825,7 @@ export default function App() {
         {/* Updates, theme and diagnostics live in Settings to keep this bar to the essentials. */}
         <div className="actions">
           <button className="btn primary" onClick={onPickAndIngest}>
-            Ingest PDF
+            Add PDF
           </button>
           <button className="btn" onClick={() => setSettingsOpen(true)}>
             Settings
@@ -1159,31 +843,37 @@ export default function App() {
               <button className="btn small" onClick={refreshSources} title="Reload the list of sources">
                 Refresh
               </button>
-              <button className="btn small" onClick={() => setSourcesOpen((v) => !v)}>
+              <button
+                className="btn small"
+                onClick={() => setSourcesOpen((v) => !v)}
+                aria-expanded={sourcesOpen}
+                aria-controls={sourcesListId}
+              >
                 {sourcesOpen ? "Collapse" : "Expand"}
               </button>
             </div>
           </div>
 
-          <div className="panelBody" style={{ display: sourcesOpen ? "block" : "none" }}>
+          <div className="panelBody" id={sourcesListId} style={{ display: sourcesOpen ? "block" : "none" }}>
             {sources.length === 0 ? (
               <div style={{ color: "var(--muted)", fontSize: 13 }}>
-                No sources yet. Ingest a PDF to begin.
+                No sources yet. Add a PDF to begin.
               </div>
             ) : (
               sources.map((s) => (
                 <div className="sourceCard" key={s.id} title={`${s.path}\nSHA-256: ${s.sha256}`}>
                   <div className="sourceTitle">{s.title}</div>
                   <div className="sourceMeta">
-                    <span>{s.pages ?? 0} pages</span>
+                    <span>{plural(s.pages, "page")}</span>
                   </div>
 
                   <div className="row" style={{ marginTop: 10 }}>
                     <label className="chk">
                       <input
                         type="checkbox"
-                        checked={(s.enabled ?? 0) === 1}
+                        checked={s.enabled}
                         onChange={(e) => toggleSourceEnabled(s.id, e.target.checked)}
+                        aria-label={`Enabled: ${s.title}`}
                       />
                       Enabled
                     </label>
@@ -1193,12 +883,14 @@ export default function App() {
                         className="btn small"
                         onClick={() => checkBookAI(s.id, s.title)}
                         title="Find pages whose AI version is outdated or fails the current text check"
+                        aria-label={`Check AI pages: ${s.title}`}
                       >
                         Check AI pages
                       </button>
                       <button
                         className="btn small danger"
-                        onClick={() => deleteSource(s.id)}
+                        onClick={() => deleteSource(s.id, s.title)}
+                        aria-label={`Delete ${s.title}`}
                       >
                         Delete
                       </button>
@@ -1216,7 +908,8 @@ export default function App() {
               className="input"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search… (e.g., kenku, mothman)"
+              placeholder="Search… (e.g. kenku, mothman)"
+              aria-label="Search the library"
               onKeyDown={(e) => {
                 if (e.key === "Enter") runSearch();
               }}
@@ -1245,22 +938,22 @@ export default function App() {
               </div>
             ) : (
               results.map((r, idx) => (
-                <div
+                <button
+                  type="button"
                   className="resultCard"
                   key={`${r.source_id}-${r.page_num}-${idx}`}
                   onClick={() => openReader(r)}
-                  title={`Click to read this page\n${r.source_path}`}
+                  title={`Read this page\n${r.source_path}`}
                 >
-                  <div className="resultTop">
-                    <div className="resultHeading">
-                      {(r.heading && r.heading.trim()) || "(No heading)"}
-                    </div>
-                    <div className="resultSrc">
-                      {r.source_title} • p. {r.page_num}
-                    </div>
-                  </div>
-                  <div className="resultSnippet">{markedSnippet(r.snippet)}</div>
-                </div>
+                  {/* Inside a button only phrasing content is allowed: spans, styled as blocks. */}
+                  <span className="resultTop">
+                    <span className="resultHeading">{r.heading?.trim() || "(No heading)"}</span>
+                    <span className="resultSrc">
+                      {r.source_title} · p. {r.page_num}
+                    </span>
+                  </span>
+                  <span className="resultSnippet">{markedSnippet(r.snippet)}</span>
+                </button>
               ))
             )}
           </div>
@@ -1269,23 +962,29 @@ export default function App() {
 
       {/* Page reader */}
       {reader && (
-        <div className="overlay" onMouseDown={closeReader}>
-          <div className="modal reader" onMouseDown={(e) => e.stopPropagation()}>
+        <Dialog
+          className="reader"
+          layer="reader"
+          onClose={closeReader}
+          closeOnBackdrop
+          header={(titleId) => (
             <div className="modalHeader">
               <div className="readerTitle">
-                <h3 title={readerPage?.path}>{readerPage?.title ?? "Loading…"}</h3>
+                <h3 id={titleId} title={readerPage?.path}>
+                  {readerPage?.title ?? "Loading…"}
+                </h3>
                 <div className="readerSub">
                   Page {reader.page}
                   {readerPage ? ` of ${readerPage.page_count}` : ""}
-                  {readerPage ? ` • ${VIEW_LABELS[readerView]}` : ""}
+                  {readerPage ? ` · ${VIEW_LABELS[readerView]}` : ""}
                   {readerView === "ai" && readerPage?.ai_model ? ` (${readerPage.ai_model})` : ""}
                   {readerView === "ai" && readerPage?.ai_stale
                     ? readerPage.ai_check_failed
-                      ? " • fails the current text check"
-                      : " • outdated, reformat to refresh"
+                      ? " · fails the current text check"
+                      : " · outdated, reformat to refresh"
                     : ""}
                   {readerPage && searchedFor && readerView !== "changes" && !editing
-                    ? ` • ${matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"}` : "no matches"} for “${searchedFor.replace(/"/g, "")}”`
+                    ? ` · ${matchCount ? plural(matchCount, "match", "matches") : "no matches"} for “${searchedFor.replace(/"/g, "")}”`
                     : ""}
                 </div>
               </div>
@@ -1293,7 +992,8 @@ export default function App() {
                 Close
               </button>
             </div>
-
+          )}
+        >
             <div className="readerBar">
               <button className="btn small" onClick={() => turnReaderPage(-1)} disabled={readerLoading || reader.page <= 1}>
                 ← Prev
@@ -1310,6 +1010,7 @@ export default function App() {
                 {readerPage?.edited_md != null && (
                   <button
                     className={readerView === "edited" ? "on" : ""}
+                    aria-pressed={readerView === "edited"}
                     onClick={() => setReaderView("edited")}
                     title={`Your own edit of this page${readerPage.edited_at ? ` (saved ${readerPage.edited_at} UTC)` : ""}`}
                   >
@@ -1318,6 +1019,7 @@ export default function App() {
                 )}
                 <button
                   className={readerView === "ai" ? "on" : ""}
+                  aria-pressed={readerView === "ai"}
                   onClick={() => setReaderView("ai")}
                   disabled={!readerPage?.ai_md}
                   title={readerPage?.ai_md ? "AI-formatted text" : "Not AI formatted yet"}
@@ -1326,6 +1028,7 @@ export default function App() {
                 </button>
                 <button
                   className={readerView === "clean" ? "on" : ""}
+                  aria-pressed={readerView === "clean"}
                   onClick={() => setReaderView("clean")}
                   title="Rule-based cleanup of the extracted text"
                 >
@@ -1333,6 +1036,7 @@ export default function App() {
                 </button>
                 <button
                   className={readerView === "raw" ? "on" : ""}
+                  aria-pressed={readerView === "raw"}
                   onClick={() => setReaderView("raw")}
                   disabled={!readerPage?.raw_text}
                   title={readerPage?.raw_text ? "Text exactly as extracted from the PDF" : "Re-open the book to capture raw text"}
@@ -1341,6 +1045,7 @@ export default function App() {
                 </button>
                 <button
                   className={readerView === "changes" ? "on" : ""}
+                  aria-pressed={readerView === "changes"}
                   onClick={() => setReaderView("changes")}
                   disabled={!readerPage?.ai_md}
                   title={readerPage?.ai_md ? "See exactly what the AI changed compared with the cleaned text" : "Not AI formatted yet"}
@@ -1485,32 +1190,22 @@ export default function App() {
                 </div>
               ) : readerLoading && !readerPage ? (
                 <div className="readerNote">Loading page… (the first time a book opens it is prepared for reading, which can take a few seconds)</div>
-              ) : readerPage ? (
-                readerView === "raw" ? (
-                  <pre className="rawText">{highlightText(readerPage.raw_text ?? "", highlight)}</pre>
+              ) : readerPage && readerText !== null ? (
+                readerView === "raw" && readerPage.raw_text ? (
+                  <pre className="rawText">{highlightText(readerText, highlight)}</pre>
                 ) : readerView === "changes" && readerPage.ai_md ? (
                   <ChangesView
                     before={readerPage.clean_md}
                     after={readerPage.ai_md}
                     aiStale={readerPage.ai_stale}
-                    aiCheckFailed={Boolean(readerPage.ai_check_failed)}
+                    aiCheckFailed={readerPage.ai_check_failed}
                   />
                 ) : (
-                  <Markdown
-                    text={
-                      readerView === "edited" && readerPage.edited_md != null
-                        ? readerPage.edited_md
-                        : readerView === "ai" && readerPage.ai_md
-                        ? readerPage.ai_md
-                        : readerPage.clean_md
-                    }
-                    highlight={highlight}
-                  />
+                  <Markdown text={readerText} highlight={highlight} />
                 )
               ) : null}
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {aiRun && (
@@ -1539,29 +1234,31 @@ export default function App() {
             onCheckUpdates: checkForUpdates,
             checkingUpdates,
             updateStatus,
-            versionText: `UI ${FRONTEND_VERSION} • API ${versionInfo?.backend_version ?? "..."} • Updater ${versionInfo?.updater_version ?? "..."}${
-              versionInfo ? ` • ${versionInfo.platform}${versionInfo.updater_present ? "" : " • updater missing"}` : ""
+            versionText: `UI ${FRONTEND_VERSION} · API ${versionInfo?.backend_version ?? "…"} · Updater ${versionInfo?.updater_version ?? "…"}${
+              versionInfo ? ` · ${versionInfo.platform}${versionInfo.updater_present ? "" : " · updater missing"}` : ""
             }`,
           }}
         />
       )}
 
-      {/* Ingest modal */}
+      {/* Import window: progress of the current import, which keeps running if it's closed */}
       {ingestOpen && (
-        <div className="overlay" onMouseDown={() => { /* click-out disabled */ }}>
-          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+        <Dialog
+          onClose={() => setIngestOpen(false)}
+          header={(titleId) => (
             <div className="modalHeader">
-              <h3>Ingest PDF</h3>
+              <h3 id={titleId}>Add a PDF</h3>
               <div className="row">
                 <button className="btn small" onClick={() => setIngestOpen(false)}>
                   Close
                 </button>
-                <button className="btn small danger" onClick={cancelIngest}>
-                  Cancel ingest
+                <button className="btn small danger" onClick={cancelIngest} disabled={!ingestRunning}>
+                  Cancel import
                 </button>
               </div>
             </div>
-
+          )}
+        >
             <div className="modalBody">
               <div className="row" style={{ alignItems: "stretch" }}>
                 <input
@@ -1569,74 +1266,59 @@ export default function App() {
                   value={ingestPath}
                   onChange={(e) => setIngestPath(e.target.value)}
                   placeholder="/path/to/book.pdf"
+                  aria-label="PDF file path"
                 />
-                <button
-                  className="btn"
-                  onClick={async () => {
-                    const file = await pickPdfFile();
-                    if (file) await startIngestWithFile(file);
-                  }}
-                >
+                <button className="btn" onClick={onPickAndIngest}>
                   Upload PDF
                 </button>
                 <button
                   className="btn primary"
-                  onClick={() => startIngestWithPath(ingestPath)}
+                  onClick={() =>
+                    startIngest(() => api.startIngest(ingestPath), "Starting the import…", "Couldn't start the import", "start_ingest_pdf")
+                  }
                 >
-                  Start ingest
+                  Import
                 </button>
               </div>
 
               <div className="progressWrap">
-                <div style={{ color: "var(--muted)", fontSize: 12 }}>
-                  {progress
-                    ? `Stage: ${progress.stage} • ${progress.message}`
-                    : "Waiting…"}
+                {/* The only live region here: the clock and the log below would be read out on every tick. */}
+                <div role="status" style={{ color: "var(--muted)", fontSize: 12 }}>
+                  {progress ? progress.message : "Waiting…"}
                 </div>
 
                 <div style={{ marginTop: 10 }}>
-                  <div className="barOuter">
-                    <div
-                      className="barInner"
-                      style={{
-                        width:
-                          progress && progress.total > 0
-                            ? `${Math.min(
-                                100,
-                                Math.round((progress.current / progress.total) * 100)
-                              )}%`
-                            : "0%",
-                      }}
-                    />
+                  <div
+                    className="barOuter"
+                    role="progressbar"
+                    aria-label="Import progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={ingestPercent}
+                  >
+                    <div className="barInner" style={{ width: `${ingestPercent}%` }} />
                   </div>
                   <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
                     {progress && progress.total > 0
-                      ? `${progress.current} / ${progress.total} (${Math.min(
-                          100,
-                          Math.round((progress.current / progress.total) * 100)
-                        )}%)`
+                      ? `${progress.current} / ${progress.total} (${ingestPercent}%)`
                       : "0 / 0 (0%)"}
                   </div>
 
                   {progress?.error ? (
-                    <div style={{ marginTop: 8, color: "var(--danger)" }}>
-                      {String(progress.error)}
-                    </div>
+                    <div style={{ marginTop: 8, color: "var(--danger)" }}>{progress.error}</div>
                   ) : null}
 
                   {ingestStarted && (
                     <div className="hint" style={{ marginTop: 6 }}>
-                      Elapsed {Math.floor(((progress?.done ? ingestLog[ingestLog.length - 1]?.at ?? ingestNow : ingestNow) - ingestStarted) / 60000)}:
-                      {String(Math.floor((((progress?.done ? ingestLog[ingestLog.length - 1]?.at ?? ingestNow : ingestNow) - ingestStarted) / 1000) % 60)).padStart(2, "0")}
+                      Elapsed{" "}
+                      {formatElapsed((progress?.done ? ingestLog[ingestLog.length - 1]?.at ?? ingestNow : ingestNow) - ingestStarted)}
                     </div>
                   )}
                   {ingestLog.length > 0 && (
-                    <ol className="aiWindowLog" style={{ marginTop: 8 }}>
+                    <ol className="ingestLog">
                       {ingestLog.map((entry, i) => (
                         <li key={i}>
-                          <span className="hint">
-                            {ingestStarted ? `${Math.round((entry.at - ingestStarted) / 1000)}s` : ""}
-                          </span>{" "}
+                          <span className="hint">{ingestStarted ? formatElapsed(entry.at - ingestStarted) : ""}</span>{" "}
                           {entry.message}
                         </li>
                       ))}
@@ -1645,31 +1327,35 @@ export default function App() {
                 </div>
               </div>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
-      {/* Duplicate modal */}
+      {/* Book check: which AI pages of one book are outdated, and "Reformat all" */}
       {bookCheck && (
-        <div className="overlay" onMouseDown={() => !bookRunning && setBookCheck(null)}>
-          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+        <Dialog
+          onClose={bookRunning ? undefined : () => setBookCheck(null)}
+          closeOnBackdrop
+          header={(titleId) => (
             <div className="modalHeader">
-              <h3>AI pages in {bookCheck.title}</h3>
+              <h3 id={titleId}>AI pages in {bookCheck.title}</h3>
               <button className="btn small" onClick={() => setBookCheck(null)} disabled={bookRunning}>
                 Close
               </button>
             </div>
+          )}
+        >
             <div className="modalBody" style={{ fontSize: 13, lineHeight: 1.5 }}>
               {bookCheck.error ? (
-                <div className="readerError">{bookCheck.error}</div>
+                <div className="errorText">{bookCheck.error}</div>
               ) : !bookCheck.report ? (
                 <div style={{ color: "var(--muted)" }}>Checking every AI-formatted page…</div>
               ) : bookCheck.report.ai_pages === 0 ? (
                 <div>No pages of this book have been AI formatted yet.</div>
               ) : bookCheck.report.outdated.length === 0 ? (
                 <div>
-                  All {bookCheck.report.ai_pages} AI-formatted page{bookCheck.report.ai_pages === 1 ? "" : "s"} pass the current
-                  text check.
+                  {bookCheck.report.ai_pages === 1
+                    ? "The AI-formatted page passes the current text check."
+                    : `All ${bookCheck.report.ai_pages} AI-formatted pages pass the current text check.`}
                 </div>
               ) : (
                 <>
@@ -1706,7 +1392,7 @@ export default function App() {
                   ) : (
                     <div>
                       {bookRun.stopped ? "Stopped. " : "Finished. "}
-                      {bookRun.ok.length} page{bookRun.ok.length === 1 ? "" : "s"} reformatted and checked.
+                      {plural(bookRun.ok.length, "page")} reformatted and checked.
                     </div>
                   )}
                   {bookRun.needsYou.length > 0 && (
@@ -1758,27 +1444,24 @@ export default function App() {
                 )}
               </div>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
-      {dupOpen && dup && (
-        <div className="overlay">
-          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+      {/* Duplicate: the PDF being added is already in the library. No Escape: every way out is a choice. */}
+      {dup && (
+        <Dialog
+          header={(titleId) => (
             <div className="modalHeader">
-              <h3>Duplicate detected</h3>
-              <button
-                className="btn small"
-                title="Closing keeps the existing source and discards the new ingest"
-                onClick={() => resolveDuplicate("discard")}
-              >
-                Close
+              <h3 id={titleId}>Already in the library</h3>
+              <button className="btn small" title="Keep the existing source and don't add this file" onClick={() => resolveDuplicate("discard")}>
+                Discard new
               </button>
             </div>
+          )}
+        >
             <div className="modalBody">
               <div style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.4 }}>
-                The file you selected matches an existing source (same SHA-256).
-                Choose what you want to do:
+                The file you selected is identical to a source you already have (same SHA-256). Choose what to do:
               </div>
 
               <div style={{ marginTop: 10, fontSize: 13 }}>
@@ -1789,7 +1472,7 @@ export default function App() {
                   {dup.existing_path}
                 </div>
                 <div style={{ marginTop: 10 }}>
-                  <b>New file:</b> {dup.new_title ?? "(selected file)"}
+                  <b>New file:</b> {dup.new_title}
                 </div>
                 <div style={{ color: "var(--muted)" }} title={dup.new_path}>
                   {dup.new_path}
@@ -1804,20 +1487,12 @@ export default function App() {
                   Replace existing (rebuild)
                 </button>
                 <button className="btn primary" onClick={() => resolveDuplicate("new_copy")}>
-                  Ingest as new copy
+                  Add as a new copy
                 </button>
               </div>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
     </div>
   );
 }
-
-
-
-
-
-
-

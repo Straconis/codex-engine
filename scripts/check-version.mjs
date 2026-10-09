@@ -1,4 +1,5 @@
-// Fails when the version isn't the same everywhere the build and the updater read it,
+// Fails when the version isn't the same everywhere the build and the updater read it
+// (the installer gets it from package.json at build time),
 // or when its release notes are missing. Run by CI; also `node scripts/check-version.mjs`.
 import { existsSync, readFileSync } from "node:fs";
 
@@ -12,7 +13,6 @@ const places = {
   "package-lock.json": lock.version,
   'package-lock.json packages[""]': lock.packages?.[""]?.version,
   "backend/codex_engine/config.py APP_VERSION": match("backend/codex_engine/config.py", /^APP_VERSION\s*=\s*"([^"]+)"/m),
-  "installer/codex-engine.iss MyAppVersion": match("installer/codex-engine.iss", /#define\s+MyAppVersion\s+"([^"]+)"/),
 };
 
 const problems = Object.entries(places)

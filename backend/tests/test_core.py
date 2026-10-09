@@ -6,7 +6,6 @@ import io
 import sqlite3
 
 import pytest
-
 from codex_engine import db
 from codex_engine.events import EventBroker
 from codex_engine.models import ChunkRow
@@ -199,7 +198,7 @@ def test_old_update_files_are_cleaned_up(tmp_path, monkeypatch):
 
     assert update_client.cleanup_update_files() == 1200
     assert not old_installer.exists() and not old_copy.exists() and fresh.exists()
-    assert update_client.cleanup_update_files() == 0  # nothing left to do; missing folders are fine
+    assert update_client.cleanup_update_files() == 0  # running it again finds nothing to remove
 
 
 # ---- 0.3.12 ----------------------------------------------------------------------------

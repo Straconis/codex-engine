@@ -7,7 +7,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 pytest.importorskip("pymupdf")
 
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
@@ -25,13 +25,13 @@ def test_health_identifies_codex_engine(client):
 
 
 def test_post_without_client_header_is_rejected(client):
-    r = client.post("/api/ingest", json={"path": "C:/nope.pdf"})
+    r = client.post("/api/ingest", json={"path": "/nope.pdf"})
     assert r.status_code == 403
 
 
-def test_post_with_client_header_is_allowed(client):
-    r = client.post("/api/ingest", json={"path": "C:/nope.pdf"}, headers={"X-Codex-Engine-Client": "1"})
-    assert r.status_code == 400  # reaches the handler; file doesn't exist
+def test_post_with_client_header_is_allowed(client, tmp_path):
+    r = client.post("/api/ingest", json={"path": str(tmp_path / "nope.pdf")}, headers={"X-Codex-Engine-Client": "1"})
+    assert r.status_code == 404  # reaches the handler; the file doesn't exist
 
 
 def test_search_bad_syntax_is_not_a_500(client):
@@ -68,7 +68,7 @@ def test_open_pdf_refuses_a_folder(client, tmp_path):
     folder = tmp_path / "looks-like.pdf"
     folder.mkdir()
     r = client.post("/api/open-pdf", json={"path": str(folder), "page": 1}, headers={"X-Codex-Engine-Client": "1"})
-    assert r.status_code == 400
+    assert r.status_code == 404
 
 
 def test_cors_allows_only_what_the_dev_ui_sends(client):
@@ -80,3 +80,11 @@ def test_cors_allows_only_what_the_dev_ui_sends(client):
     assert odd.status_code == 400
     other = client.options("/api/settings", headers={**preflight, "Origin": "https://evil.example"})
     assert other.status_code == 400
+
+
+def test_bad_requests_are_rejected_before_reaching_the_handlers(client):
+    headers = {"X-Codex-Engine-Client": "1"}
+    assert client.post("/api/open-pdf", json={"path": "x.pdf", "page": 0}, headers=headers).status_code == 422
+    assert client.post("/api/ingest/duplicate", json={"ingest_id": 1, "action": "keep both"}, headers=headers).status_code == 422
+    assert client.post("/api/ingest", json={"path": ""}, headers=headers).status_code == 422
+    assert client.get("/api/search", params={"query": "x" * 1001}).status_code == 422

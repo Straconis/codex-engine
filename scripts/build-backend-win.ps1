@@ -1,27 +1,12 @@
-$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\common.ps1"
 
-function Invoke-Checked($FilePath, [string[]]$Arguments, $WorkingDirectory = $null) {
-  $argText = $Arguments -join " "
-  Write-Host "> $FilePath $argText"
-  if ($WorkingDirectory) { Push-Location $WorkingDirectory }
-  try {
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-      throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $argText"
-    }
-  }
-  finally {
-    if ($WorkingDirectory) { Pop-Location }
-  }
-}
-
-$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$root = $RepoRoot
 $backend = Join-Path $root "backend"
 $icon = Join-Path $root "assets\icons-v2\codex-engine-v2.ico"
-$python = if ($env:CODEX_ENGINE_PYTHON) { $env:CODEX_ENGINE_PYTHON } else { "python" }
+$python = $Python
 
 # Fail fast if the backend version drifted from package.json (it feeds the update check).
-$version = (Get-Content (Join-Path $root "package.json") -Raw | ConvertFrom-Json).version
+$version = $PackageVersion
 $configText = Get-Content (Join-Path $backend "codex_engine\config.py") -Raw
 if ($configText -notmatch 'APP_VERSION\s*=\s*"([^"]+)"') { throw "APP_VERSION not found in backend\codex_engine\config.py" }
 if ($Matches[1] -ne $version) {
