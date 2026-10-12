@@ -14,7 +14,8 @@ APP_AUTHOR = False
 
 
 def app_data_dir() -> Path:
-    path = Path(user_data_dir(APP_NAME, APP_AUTHOR))
+    override = os.environ.get("CODEX_ENGINE_DATA_DIR")
+    path = Path(override).expanduser().resolve() if override else Path(user_data_dir(APP_NAME, APP_AUTHOR))
     path.mkdir(parents=True, exist_ok=True)
     return path
 

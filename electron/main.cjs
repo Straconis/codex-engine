@@ -16,7 +16,7 @@ const DEV_FRONTEND_URL = process.env.CODEX_ENGINE_FRONTEND_URL || "http://127.0.
 // CODEX_ENGINE_USE_BUILD=1 runs the built UI (dist/) in development, as the installed app does.
 const FRONTEND_URL = isPackaged || process.env.CODEX_ENGINE_USE_BUILD === "1" ? null : DEV_FRONTEND_URL;
 const SHUTDOWN_TOKEN = crypto.randomBytes(32).toString("hex");
-// How long to wait for the backend (and its Ollama) to stop by itself before force-closing it.
+// How long to wait for the backend (and its local runtime) to stop by itself before force-closing it.
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3000;
 const SHUTDOWN_GRACE_MS = 12000;
 // The Start menu's "Codex Engine Data Folder" shortcut runs the app with this flag.
@@ -210,6 +210,7 @@ async function startBackend() {
       ...process.env,
       PYTHONUNBUFFERED: "1",
       CODEX_ENGINE_SHUTDOWN_TOKEN: SHUTDOWN_TOKEN,
+      CODEX_ENGINE_LOCAL_RUNTIME_DIR: path.join(isPackaged ? process.resourcesPath : path.join(ROOT, "resources"), "llama"),
       CODEX_ENGINE_UPDATER_EXE: updaterExecutable(),
       CODEX_ENGINE_APP_EXE: appExecutable(),
     },
@@ -544,6 +545,15 @@ function createWindow() {
   // Keep the version in the title bar: the page's <title> would otherwise replace it.
   mainWindow.on("page-title-updated", (event) => event.preventDefault());
 
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const target = new URL(url);
+      if (target.protocol === "https:" && ["platform.deepseek.com", "api-docs.deepseek.com"].includes(target.hostname)) {
+        shell.openExternal(target.href).catch(() => undefined);
+      }
+    } catch {}
+    return { action: "deny" };
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     setConsoleOpen(false);

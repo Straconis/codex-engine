@@ -84,64 +84,7 @@ def ollama_version(url: str, timeout: float = 1.0) -> str | None:
 
 # ---- process lifetime -------------------------------------------------------------
 
-def _kill_with_parent_windows(proc: subprocess.Popen):
-    """Put proc in a Job Object that kills it when this (backend) process exits."""
-    import ctypes
-    from ctypes import wintypes
-
-    class BasicLimits(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_int64),
-            ("PerJobUserTimeLimit", ctypes.c_int64),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        ]
-
-    class IoCounters(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_uint64) for name in ("Read", "Write", "Other", "ReadBytes", "WriteBytes", "OtherBytes")]
-
-    class ExtendedLimits(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", BasicLimits),
-            ("IoInfo", IoCounters),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-
-    job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    info = ExtendedLimits()
-    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # 9 = ExtendedLimitInformation
-    kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc._handle)))  # type: ignore[attr-defined]
-    return job  # the handle must stay open for as long as the backend runs
-
-
-def _close_job(job, terminate: bool) -> None:
-    """Optionally kill every process in the job, then release the handle."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    if terminate:
-        kernel32.TerminateJobObject(job, 1)
-    kernel32.CloseHandle(job)  # with KILL_ON_JOB_CLOSE this also ends anything left
+from .process_lifetime import _kill_with_parent_windows, _close_job
 
 
 # ---- manager ---------------------------------------------------------------------
@@ -218,7 +161,7 @@ class OllamaManager:
         with self._lock:
             self._stop_locked()
             self._url = self._target_url(s)
-            if not s.ai_enabled:
+            if not s.ai_enabled or s.ai_provider == "deepseek":
                 self._set(OFF, "AI formatting is turned off in Settings.")
             elif self._env_url() or not s.manage_ollama:
                 self._set(EXTERNAL, f"Using the Ollama at {self._url}.")

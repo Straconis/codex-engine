@@ -85,23 +85,24 @@ export type AIStatus = {
   models: string[];
   model: string | null;
   error: string | null;
-  state: "idle" | "starting" | "running" | "external" | "off" | "not_installed" | "error";
-  mode: "managed" | "external" | "off";
+  state: "idle" | "starting" | "running" | "external" | "off" | "not_installed" | "missing_model" | "error";
+  mode: "local" | "off" | "deepseek";
   url: string;
   models_dir: string;
-  ollama_path: string;
   pull: ModelPull | null;
+  catalog?: { id: string; label: string; size: number }[];
 };
 
 // Per-machine settings (stored in the app data folder on each computer).
 export type AppSettings = {
   ai_enabled: boolean;
-  manage_ollama: boolean; // true: Codex Engine runs its own Ollama
-  ollama_path: string; // "" = auto-detect
-  models_dir: string; // "" = Ollama's default folder
-  managed_port: number;
-  external_url: string;
-  model: string;
+  ai_provider: "local" | "deepseek";
+  local_model: string;
+  deepseek_enabled: boolean;
+  deepseek_confirm_cost: boolean;
+  deepseek_model: string;
+  deepseek_has_key: boolean;
+  models_dir: string; // empty uses Codex Engine’s data folder
 };
 
 export type IngestProgress = {
@@ -213,25 +214,35 @@ export const api = {
   checkBookAI: (sourceId: number) => request<BookAICheck>(`/api/sources/${sourceId}/ai-check`),
   getSettings: () => request<{ settings: AppSettings; path: string }>("/api/settings"),
   // 422 with a readable message if a value is invalid (e.g. a relative folder path).
-  updateSettings: (changes: Partial<AppSettings>) =>
+  updateSettings: (changes: Partial<AppSettings> & { deepseek_api_key?: string }) =>
     request<{ settings: AppSettings; path: string }>("/api/settings", { method: "PUT", body: JSON.stringify(changes) }),
+  testDeepSeek: () => request<{ available: boolean; balance: string }>("/api/ai/deepseek/test", { method: "POST", body: "{}" }),
   pullModel: (model: string) =>
     request<ModelPull>("/api/ai/models/pull", { method: "POST", body: JSON.stringify({ model }) }),
-  // 503 = AI unavailable (no Ollama/model); 200 with ai_error = output rejected, cleaned text kept.
+  // 503 = AI unavailable (local model unavailable); 200 with ai_error = output rejected, cleaned text kept.
   // useCleanForFailed: after `pending`, keep the cleaned text for the failed sections.
-  aiFormatPage: (
+  aiFormatPage: async (
     sourceId: number,
     page: number,
     opts: { model?: string | null; force?: boolean; useCleanForFailed?: boolean } = {}
-  ) =>
-    request<PageView>(`/api/sources/${sourceId}/pages/${page}/ai-format`, {
-      method: "POST",
-      body: JSON.stringify({
-        model: opts.model ?? null,
-        force: opts.force ?? false,
-        use_clean_for_failed: opts.useCleanForFailed ?? false,
-      }),
-    }),
+  ) => {
+    const body = { model: opts.model ?? null, force: opts.force ?? false, use_clean_for_failed: opts.useCleanForFailed ?? false };
+    const quote = await request<{ required: boolean; approval_token: string | null; estimated_usd?: number | null;
+      higher_estimate_usd?: number | null; model?: string; pricing_checked?: string; disclaimer?: string }>(
+      `/api/sources/${sourceId}/pages/${page}/ai-estimate`, { method: "POST", body: JSON.stringify(body) });
+    if (quote.required) {
+      const money = (value: number) => `$${value.toFixed(6)} USD`;
+      const estimate = quote.estimated_usd == null
+        ? "A cost estimate is unavailable for this model. Your API account will still be charged."
+        : `Estimated charge: ${money(quote.estimated_usd)}. A higher estimate allowing for reply limits and a retry is ${money(quote.higher_estimate_usd ?? quote.estimated_usd)}. Neither amount is a guaranteed bill or spending cap.`;
+      if (!confirm(`DeepSeek formatting — page ${page}, ${quote.model}\n\n${estimate}\n\nThis sends page text to DeepSeek. Rates last checked ${quote.pricing_checked}. ${quote.disclaimer ?? "Estimate only; the actual charge can differ."}\n\nFormat this page? You can turn off cost confirmations in Settings.`)) {
+        throw new Error("Cancelled. No DeepSeek request was sent.");
+      }
+    }
+    return request<PageView>(`/api/sources/${sourceId}/pages/${page}/ai-format`, {
+      method: "POST", body: JSON.stringify({ ...body, cost_approval: quote.approval_token }),
+    });
+  },
   saveEdit: (sourceId: number, page: number, markdown: string) =>
     request<PageView>(`/api/sources/${sourceId}/pages/${page}/edit`, { method: "PUT", body: JSON.stringify({ markdown }) }),
   // Stops a running AI format of the page; its request then fails with 409 "Cancelled...".

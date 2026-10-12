@@ -254,7 +254,7 @@ def api(tmp_path, monkeypatch):
     from codex_engine import app as app_module
 
     app_module._schema_ready = False
-    app_module.ollama.apply(start=False)
+    app_module.local_ai.apply(start=False)
     return TestClient(app_module.app, base_url="http://127.0.0.1")
 
 
@@ -273,7 +273,7 @@ def test_settings_api_roundtrip_and_validation(api, tmp_path):
 
 def test_status_api_reports_mode(api):
     status = api.get("/api/ai/status").json()
-    assert status["mode"] == "external" and "available" in status
+    assert status["mode"] == "local" and status["state"] == "missing_model" and "available" in status
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Job Objects are Windows-only")
@@ -390,7 +390,7 @@ def test_saving_settings_applies_before_the_response_returns(api):
     assert api.put("/api/settings", json={"ai_enabled": False}, headers=headers).status_code == 200
     assert api.get("/api/ai/status").json()["state"] == "off"
     assert api.put("/api/settings", json={"ai_enabled": True}, headers=headers).status_code == 200
-    assert api.get("/api/ai/status").json()["state"] == "external"
+    assert api.get("/api/ai/status").json()["state"] == "missing_model"
 
 
 # ---- 0.3.12: fixes from the 0.3.10 sweep -----------------------------------------------------
@@ -429,11 +429,11 @@ def test_installing_ollama_later_is_noticed_without_a_restart(managed, monkeypat
     assert m.status()["state"] == "running"
 
 
-def test_changing_only_the_model_does_not_restart_ollama(api, monkeypatch):
+def test_changing_unused_legacy_settings_does_not_restart_local_runtime(api, monkeypatch):
     from codex_engine import app as app_module
 
     calls = []
-    monkeypatch.setattr(app_module.ollama, "apply", lambda start=True: calls.append(start))
+    monkeypatch.setattr(app_module.local_ai, "apply", lambda start=True: calls.append(start))
     headers = {"X-Codex-Engine-Client": "1"}
     assert api.put("/api/settings", json={"model": "gemma3:1b"}, headers=headers).status_code == 200
     assert calls == []

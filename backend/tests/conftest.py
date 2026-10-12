@@ -13,6 +13,7 @@ def _isolated_settings(tmp_path_factory, monkeypatch):
     path = tmp_path_factory.mktemp("settings") / "settings.json"
     path.write_text('{"manage_ollama": false}', encoding="utf-8")
     monkeypatch.setenv("CODEX_ENGINE_SETTINGS", str(path))
+    monkeypatch.setenv("CODEX_ENGINE_DATA_DIR", str(path.parent / "data"))
     monkeypatch.delenv("CODEX_ENGINE_OLLAMA_URL", raising=False)
     monkeypatch.delenv("CODEX_ENGINE_OLLAMA_MODEL", raising=False)
     yield path

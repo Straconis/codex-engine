@@ -17,13 +17,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import ai_format, db
+from . import ai_format, db, cost_estimate
 from .config import APP_VERSION
 from .events import EventBroker
 from .formatting import FORMATTER_VERSION
 from .ingest import IngestManager, index_saved_edits, page_chunks, rebuild_source
 from .models import AIFormatArgs, EditPageArgs, OpenPdfArgs, PullModelArgs, ResolveDuplicateArgs, SetEnabledArgs, StartIngestArgs
-from .ollama_manager import OLLAMA_SETTINGS, OllamaManager
+from .local_manager import LocalModelManager
 from .platforming import app_data_dir, database_path, open_file_at_page
 from .settings import SettingsStore
 from .uploads import store_upload
@@ -55,13 +55,13 @@ class RequireClientHeaderMiddleware:
 
 @asynccontextmanager
 async def lifespan(_app):
-    # Start the managed Ollama in the background so the first "AI format" is quick.
+    # Start the managed local runtime in the background so the first "AI format" is quick.
     # Never blocks startup: AI is optional.
-    threading.Thread(target=ollama.ensure_running, daemon=True).start()
+    threading.Thread(target=local_ai.ensure_running, daemon=True).start()
     # The downloaded installer and updater copy from a previous update aren't needed anymore.
     threading.Thread(target=cleanup_update_files, daemon=True).start()
     yield
-    ollama.stop()
+    local_ai.stop()
 
 
 app = FastAPI(title="Codex Engine API", lifespan=lifespan)
@@ -81,7 +81,7 @@ app.add_middleware(
 
 broker = EventBroker()
 settings_store = SettingsStore()
-ollama = OllamaManager(settings_store, state_dir=app_data_dir(), log_dir=app_data_dir() / "logs", publish=broker.publish)
+local_ai = LocalModelManager(settings_store, state_dir=app_data_dir(), log_dir=app_data_dir() / "logs", publish=broker.publish)
 
 _schema_lock = threading.Lock()
 _schema_ready = False
@@ -114,8 +114,8 @@ def _authorized_shutdown(token: str | None) -> bool:
 
 
 def stop_and_exit() -> None:
-    """Stop the managed Ollama, then end the process at once."""
-    ollama.stop()  # os._exit skips cleanup, and a managed Ollama must not outlive the app
+    """Stop the managed local runtime, then end the process at once."""
+    local_ai.stop()  # os._exit skips cleanup, and a managed local runtime must not outlive the app
     os._exit(0)
 
 
@@ -423,12 +423,21 @@ def check_book_ai(source_id: int):
 
 @app.get("/api/ai/status")
 def ai_status():
-    return ollama.status()
+    s = settings_store.load()
+    if s.ai_provider != "deepseek":
+        return local_ai.status()
+    enabled = s.ai_enabled and s.deepseek_enabled
+    ready = enabled and bool(s.deepseek_key_encrypted)
+    return {"available": ready, "state": "external" if ready else "off" if not enabled else "error",
+            "mode": "deepseek", "models": [s.deepseek_model] if ready else [],
+            "model": s.deepseek_model if ready else None,
+            "error": None if ready else "DeepSeek is disabled." if not enabled else "Add your DeepSeek API key in Settings.",
+            "url": "https://api.deepseek.com", "models_dir": "", "pull": None}
 
 
 @app.get("/api/settings")
 def get_settings():
-    return {"settings": settings_store.load().model_dump(), "path": str(settings_store.path)}
+    return {"settings": settings_store.load().public(), "path": str(settings_store.path)}
 
 
 @app.put("/api/settings")
@@ -436,25 +445,98 @@ def update_settings(changes: dict = Body(...)):
     before = settings_store.load()
     try:
         saved = settings_store.update(changes)
-    except ValidationError as exc:
+    except (ValueError, OSError) as exc:
+        if not isinstance(exc, ValidationError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         problems = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'settings'}: {e['msg'].removeprefix('Value error, ')}" for e in exc.errors())
         raise HTTPException(status_code=422, detail=problems) from exc
-    # Restart Ollama only when a setting it runs with changed: a restart cuts off any
-    # formatting or model download in progress. Stop the old one before replying, so
-    # nothing that follows can reach it mid-restart; the new one starts in the background.
-    if any(getattr(before, key) != getattr(saved, key) for key in OLLAMA_SETTINGS):
-        ollama.apply(start=False)
-        threading.Thread(target=ollama.ensure_running, daemon=True).start()
-    return {"settings": saved.model_dump(), "path": str(settings_store.path)}
+    common_changed = any(getattr(before, key) != getattr(saved, key) for key in ("ai_enabled", "ai_provider"))
+    local_changed = any(getattr(before, key) != getattr(saved, key) for key in ("models_dir", "local_model"))
+    cloud_changed = any(getattr(before, key) != getattr(saved, key) for key in ("deepseek_enabled", "deepseek_model", "deepseek_key_encrypted"))
+    active_changed = common_changed or (local_changed if saved.ai_provider == "local" else cloud_changed)
+    if active_changed:
+        with _ai_jobs_lock:
+            for cancel in _ai_jobs.values():
+                cancel.set()
+    if common_changed or local_changed:
+        local_ai.apply(start=False)
+        threading.Thread(target=local_ai.ensure_running, daemon=True).start()
+    return {"settings": saved.public(), "path": str(settings_store.path)}
+
+
+def _deepseek_still_enabled(original):
+    current = settings_store.load()
+    return (current.ai_enabled and current.deepseek_enabled and current.ai_provider == "deepseek"
+            and current.deepseek_model == original.deepseek_model
+            and current.deepseek_key_encrypted == original.deepseek_key_encrypted)
+
+
+def _formatting_settings_unchanged(original):
+    if original.ai_provider == "deepseek":
+        return _deepseek_still_enabled(original)
+    current = settings_store.load()
+    return (current.ai_enabled and current.ai_provider == "local"
+            and current.local_model == original.local_model and current.models_dir == original.models_dir)
+
+
+@app.post("/api/ai/deepseek/test")
+def test_deepseek():
+    from .deepseek import DeepSeekClient
+    s = settings_store.load()
+    try:
+        return DeepSeekClient(s.deepseek_api_key, s.deepseek_model).balance()
+    except (ai_format.AIUnavailable, OSError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _cloud_sections_to_send(conn, text, s, args):
+    if args.use_clean_for_failed:
+        return []
+    model = "deepseek/" + s.deepseek_model
+    needed = []
+    for section in ai_format.split_sections(text, 3000):
+        cached = None if args.force else db.ai_cache_get(conn, ai_format.cache_key(model, section))
+        if cached is not None:
+            try:
+                ai_format.check_faithful(section, cached)
+                continue
+            except ai_format.AIFormatError:
+                pass
+        needed.append(section)
+    return needed
+
+
+def _quote_identity(source_id, page_num, text, s, args, sections):
+    return (source_id, page_num, ai_format.content_hash(text), s.deepseek_model,
+            s.deepseek_key_encrypted, ai_format.PROMPT_VERSION, args.force,
+            tuple(ai_format.content_hash(section) for section in sections))
+
+
+@app.post("/api/sources/{source_id}/pages/{page_num}/ai-estimate")
+def estimate_ai_format(source_id: int, page_num: int, args: AIFormatArgs | None = None):
+    s = settings_store.load()
+    if s.ai_provider != "deepseek" or not s.deepseek_confirm_cost or (args and args.use_clean_for_failed):
+        return {"required": False, "approval_token": None}
+    if not s.ai_enabled or not s.deepseek_enabled:
+        raise HTTPException(status_code=503, detail="DeepSeek formatting is disabled.")
+    args = args or AIFormatArgs()
+    conn = _conn()
+    try:
+        _, page = _load_page(conn, source_id, page_num)
+        sections = _cloud_sections_to_send(conn, page.clean_md, s, args)
+        identity = _quote_identity(source_id, page_num, page.clean_md, s, args, sections)
+        return cost_estimate.issue(identity, sections, s.deepseek_model)
+    finally:
+        conn.close()
 
 
 @app.post("/api/ai/models/pull")
 def pull_model(args: PullModelArgs):
     """Download a model into the configured folder. Progress arrives as `model_pull` events."""
     try:
-        return ollama.pull(args.model).__dict__
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail="Model names look like 'qwen2.5:1.5b'.") from exc
+        return local_ai.pull(args.model).__dict__
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -463,7 +545,7 @@ def pull_model(args: PullModelArgs):
 def ai_format_page(source_id: int, page_num: int, args: AIFormatArgs | None = None):
     """Format one page with the local model (each section: 1 try + automatic retries).
 
-    503 = AI unavailable (no Ollama / no model): the app keeps working without it.
+    503 = AI unavailable (no local runtime / no model): the app keeps working without it.
     200 with `pending` = some sections still failed after every retry; nothing is saved yet and
         the reader asks the user. Calling again retries only those (accepted ones are cached);
         use_clean_for_failed=true keeps their cleaned text instead.
@@ -473,30 +555,49 @@ def ai_format_page(source_id: int, page_num: int, args: AIFormatArgs | None = No
     conn = _conn()
     try:
         source, page = _load_page(conn, source_id, page_num)
-        ollama.ensure_running()
-        state = ollama.status()
+        local_ai.ensure_running()
+        state = ai_status()
         if not state["available"]:
             raise HTTPException(status_code=503, detail=f"AI formatting is unavailable: {state['error']}")
-        config = ollama.config()
+        s = settings_store.load()
+        if not s.ai_enabled or (s.ai_provider == "deepseek" and not s.deepseek_enabled):
+            raise HTTPException(status_code=503, detail="AI formatting is disabled.")
+        config = local_ai.config()
+        client = local_ai.client()
+        if s.ai_provider == "deepseek":
+            from .deepseek import DeepSeekClient
+            try:
+                client = DeepSeekClient(s.deepseek_api_key, s.deepseek_model)
+            except OSError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            # Provider prefix keeps remote and local cached results separate.
+            config = ai_format.AIConfig(model=client.cache_model, max_attempts=2)
         live = _LiveProgress(source_id, page_num, config.max_attempts)
         cancel = threading.Event()
         with _ai_jobs_lock:
             # A second run would replace the first one's Cancel flag (and then remove its own).
             if (source_id, page_num) in _ai_jobs:
                 raise HTTPException(status_code=409, detail="This page is already being formatted.")
+            if s.ai_provider == "deepseek" and s.deepseek_confirm_cost:
+                sections = _cloud_sections_to_send(conn, page.clean_md, s, args)
+                if sections and not cost_estimate.consume(args.cost_approval, _quote_identity(source_id, page_num, page.clean_md, s, args, sections)):
+                    raise HTTPException(status_code=412, detail="Approve the current DeepSeek cost estimate before formatting this page. No DeepSeek request was sent.")
             _ai_jobs[(source_id, page_num)] = cancel
         try:
             result = ai_format.format_markdown(
                 page.clean_md,
                 config=config,
+                client=client,
                 cache=_DbCache(conn),
-                model=args.model,
+                model=client.cache_model,
                 force=args.force,
                 use_clean_for_failed=args.use_clean_for_failed,
                 on_progress=live.progress,
                 on_written=live.written,
                 on_log=live.log,
-                should_stop=cancel.is_set,
+                should_stop=lambda: cancel.is_set() or (
+                    not _formatting_settings_unchanged(s)
+                ),
             )
         except ai_format.AIUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"AI formatting is unavailable: {exc}") from exc

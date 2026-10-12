@@ -116,7 +116,13 @@ def api(tmp_path, monkeypatch):
 
     app_module._schema_ready = False
     fake = FakeClient()
-    monkeypatch.setattr(ai_format, "OllamaClient", lambda config: fake)
+    from codex_engine.local_catalog import DEFAULT_MODEL
+    fake.cache_model = "qwen2.5:1.5b"
+    monkeypatch.setattr(app_module.local_ai, "ensure_running", lambda: None)
+    monkeypatch.setattr(app_module.local_ai, "client", lambda: fake)
+    monkeypatch.setattr(app_module.local_ai, "config", lambda: ai_format.AIConfig.from_env())
+    monkeypatch.setattr(app_module.local_ai, "status", lambda: {**ai_format.status(client=fake, config=ai_format.AIConfig()),
+        "state": "running" if fake.models else "missing_model", "mode": "local", "url": "", "models_dir": "", "pull": None})
     return TestClient(app_module.app, base_url="http://127.0.0.1"), app_module, fake
 
 
@@ -545,3 +551,109 @@ def test_updates_are_only_applied_by_the_windows_app_and_one_at_a_time(api, monk
         assert client.post("/api/update/apply", json={}, headers=HEADERS).status_code == 409
     finally:
         app_module._update_lock.release()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_deepseek_page_route_is_opt_in_and_reuses_validation(api, tmp_path, monkeypatch, enabled):
+    from codex_engine import deepseek, settings
+    client, module, _ = api
+    monkeypatch.setattr(settings, "protect", lambda value: "test-encrypted")
+    monkeypatch.setattr(settings, "unprotect", lambda value: "test-key")
+    module.settings_store.update({"ai_provider": "deepseek", "deepseek_enabled": enabled, "deepseek_confirm_cost": False,
+                                  "deepseek_api_key": "test-key"})
+    remote = FakeClient(models=("deepseek/deepseek-flash",))
+    remote.cache_model = "deepseek/deepseek-flash"
+    monkeypatch.setattr(deepseek, "DeepSeekClient", lambda key, model: remote)
+    sid = add_source(module, tmp_path / "book.pdf", "Original words.")
+    response = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+    if not enabled:
+        assert response.status_code == 503 and remote.calls == 0
+    else:
+        assert response.status_code == 200
+        assert response.json()["ai_md"] == "# Original words."
+        assert response.json()["ai_model"] == "deepseek/deepseek-flash"
+        assert remote.calls == 1
+
+
+def test_disabling_deepseek_cancels_in_flight_sections(api, tmp_path, monkeypatch):
+    from codex_engine import deepseek, settings
+    client, module, _ = api
+    monkeypatch.setattr(settings, "protect", lambda value: "test-encrypted")
+    monkeypatch.setattr(settings, "unprotect", lambda value: "test-key")
+    module.settings_store.update({"ai_provider": "deepseek", "deepseek_enabled": True, "deepseek_confirm_cost": False,
+                                  "deepseek_api_key": "test-key"})
+    remote = FakeClient(models=("deepseek/deepseek-flash",))
+    remote.cache_model = "deepseek/deepseek-flash"
+    def stop_during_reply(text):
+        module.settings_store.update({"deepseek_enabled": False})
+        return "# " + text
+    remote.respond = stop_during_reply
+    monkeypatch.setattr(deepseek, "DeepSeekClient", lambda key, model: remote)
+    sid = add_source(module, tmp_path / "book.pdf", "First section.\n\n" + "Next section. " * 250)
+    response = client.post(f"/api/sources/{sid}/pages/1/ai-format", json={}, headers=HEADERS)
+    assert response.status_code == 409
+    assert remote.calls == 1
+    assert client.get(f"/api/sources/{sid}/pages/1").json()["ai_md"] is None
+
+
+
+def test_deepseek_cost_approval_blocks_calls_and_can_be_disabled(api,tmp_path,monkeypatch):
+    from codex_engine import deepseek,settings
+    client,module,_=api
+    monkeypatch.setattr(settings,"protect",lambda value:"test-encrypted")
+    monkeypatch.setattr(settings,"unprotect",lambda value:"test-key")
+    module.settings_store.update({"ai_provider":"deepseek","deepseek_enabled":True,"deepseek_api_key":"test-key"})
+    remote=FakeClient(models=("deepseek/deepseek-flash",))
+    remote.cache_model="deepseek/deepseek-flash"
+    monkeypatch.setattr(deepseek,"DeepSeekClient",lambda key,model:remote)
+    sid=add_source(module,tmp_path/"book.pdf",SECTION)
+    path=f"/api/sources/{sid}/pages/1"
+    blocked=client.post(path+"/ai-format",json={},headers=HEADERS)
+    assert blocked.status_code==412 and remote.calls==0
+    quote=client.post(path+"/ai-estimate",json={},headers=HEADERS).json()
+    assert quote["required"] and quote["estimated_usd"]>0 and remote.calls==0
+    approved=client.post(path+"/ai-format",json={"cost_approval":quote["approval_token"]},headers=HEADERS)
+    assert approved.status_code==200 and remote.calls==1
+    # Cached text needs no new paid call or approval.
+    cached=client.post(path+"/ai-estimate",json={},headers=HEADERS).json()
+    assert not cached["required"] and remote.calls==1
+    assert client.post(path+"/ai-format",json={},headers=HEADERS).status_code==200
+    # A previous approval cannot authorize regeneration.
+    reused=client.post(path+"/ai-format",json={"force":True,"cost_approval":quote["approval_token"]},headers=HEADERS)
+    assert reused.status_code==412 and remote.calls==1
+    module.settings_store.update({"deepseek_confirm_cost":False})
+    assert client.post(path+"/ai-format",json={"force":True},headers=HEADERS).status_code==200
+    assert remote.calls==2
+
+
+def test_changed_text_invalidates_cost_approval(api,tmp_path,monkeypatch):
+    from codex_engine import deepseek,settings
+    client,module,_=api
+    monkeypatch.setattr(settings,"protect",lambda value:"test-encrypted")
+    monkeypatch.setattr(settings,"unprotect",lambda value:"test-key")
+    module.settings_store.update({"ai_provider":"deepseek","deepseek_enabled":True,"deepseek_api_key":"test-key"})
+    remote=FakeClient(models=("deepseek/deepseek-flash",));remote.cache_model="deepseek/deepseek-flash"
+    monkeypatch.setattr(deepseek,"DeepSeekClient",lambda key,model:remote)
+    sid=add_source(module,tmp_path/"book.pdf",SECTION)
+    path=f"/api/sources/{sid}/pages/1"
+    quote=client.post(path+"/ai-estimate",json={},headers=HEADERS).json()
+    conn=module._conn()
+    conn.execute("UPDATE pages SET clean_md=? WHERE source_id=?",("Changed text.",sid));conn.commit();conn.close()
+    assert client.post(path+"/ai-format",json={"cost_approval":quote["approval_token"]},headers=HEADERS).status_code==412
+    assert remote.calls==0
+
+
+def test_saving_unused_cloud_key_does_not_cancel_local_formatting(api,monkeypatch):
+    import threading
+    from codex_engine import settings
+    client,module,_=api
+    monkeypatch.setattr(settings,"protect",lambda value:"test-encrypted")
+    calls=[]
+    monkeypatch.setattr(module.local_ai,"apply",lambda **kwargs:calls.append(kwargs))
+    cancel=threading.Event()
+    module._ai_jobs[(999,1)]=cancel
+    try:
+        result=client.put("/api/settings",json={"deepseek_api_key":"test-key"},headers=HEADERS)
+        assert result.status_code==200 and not cancel.is_set() and not calls
+        assert not result.json()["settings"]["deepseek_enabled"]
+    finally:module._ai_jobs.pop((999,1),None)

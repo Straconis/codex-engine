@@ -1,7 +1,7 @@
 #define MyAppName "Codex Engine"
 ; Version is passed in by scripts/build-installer-inno.ps1 from package.json.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.13"
+  #define MyAppVersion "0.3.15"
 #endif
 #define MyAppPublisher "Codex Engine"
 #define MyAppExeName "Codex Engine.exe"
@@ -58,8 +58,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 
 [Code]
 // Windows' Restart Manager (Setup's "close applications automatically") can't close the
-// backend and its Ollama: they have no window. So close Codex Engine ourselves, the same
-// way clicking X does (the app then stops its backend and Ollama), and force-close
+// backend and its local runtime: they have no window. So close Codex Engine ourselves, the same
+// way clicking X does (the app then stops its backend and local runtime), and force-close
 // whatever is still running after a grace period. Only the current user's copy: other
 // people signed in to this PC keep theirs (and Setup asks them to close it if needed).
 

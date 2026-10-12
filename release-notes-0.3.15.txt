@@ -1,0 +1,4 @@
+Local formatting now uses a bundled portable runtime: install only Codex Engine, download the verified model in Settings, and format offline. No separate Ollama installation.
+Optional DeepSeek formatting uses your own encrypted API key, stays off by default, and includes illustrated billing/setup instructions.
+DeepSeek cost confirmation is on by default, with clearly labelled estimates that include possible retries; users can disable the prompts in Settings.
+Hardened verified downloads, local runtime lifetime and authentication, settings changes, cancellation, and incomplete replies.

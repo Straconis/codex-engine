@@ -13,7 +13,7 @@ This branch refactors the original Linux-oriented Tauri/Rust backend into a cros
 - Enable, disable, and delete sources
 - Open a PDF at a result page through the host OS
 - Read any result page in a built-in reader with cleaned-up formatting
-- Optionally reformat a page with a local AI model (Ollama)
+- Optionally reformat a page with a local AI model running inside Codex Engine
 
 ## Page reader and formatting
 
@@ -27,26 +27,28 @@ Third-party books don't follow a standard layout, so text goes through a formatt
 
 **Reader.** Click a search result to open the page. It shows the best available version: AI formatted, else cleaned, else raw. You can switch between the three, AI format or regenerate the page, fix the page by hand (your edit is shown first and is what search finds; undoing it brings back the other versions), and open the original PDF.
 
-**AI formatting (optional)** (`backend/codex_engine/ai_format.py`) sends the page, in sections, to a local model through [Ollama](https://ollama.com). Text never leaves the machine. The model is told to restore structure only (paragraphs, headings, lists, quotations, section breaks, tables) and never to summarise, paraphrase, censor or rewrite. Long pages are split into sections; a paragraph too long for one section (a big table or stat block) is split at line breaks, then at sentence ends, and put back together exactly. Every section is checked against its source: changing, adding or dropping any word, number, punctuation mark or symbol (a footnote asterisk, "#3", a "______" fill-in blank), reordering text, splitting or merging words ("can not" to "cannot"; only a word split across a line break may be re-joined), merging numbers ("1 0" to "10") or removing a hyphen that isn't a word split across a line ("1-2", "ten-foot") gets that section rejected, and it keeps its cleaned version. The model may not drop anything: cleanup has already removed page numbers, headers and footers. Accepted output is cached by content, so the same text is never sent to the model twice, and cached or saved AI output is re-checked against the current rules: anything that no longer passes is formatted again, or (for a saved page) the reader shows the cleaned text with a notice and a Reformat button. One page can only be AI formatted once at a time. To find every outdated AI page in a book, click **Check AI pages** on the book in the Sources list: it lists the pages that fail the current check or were made from older cleaned text, and **Reformat all** reformats them one at a time (pages where the AI still can't format part of the text are left for you to decide on in the reader). Without Ollama the app works normally and the reader says AI formatting is off.
+**AI formatting (optional)** (`backend/codex_engine/ai_format.py`) sends the page, in sections, to a local model through the bundled llama.cpp runtime. In local mode, text never leaves the machine. The model is told to restore structure only (paragraphs, headings, lists, quotations, section breaks, tables) and never to summarise, paraphrase, censor or rewrite. Long pages are split into sections; a paragraph too long for one section (a big table or stat block) is split at line breaks, then at sentence ends, and put back together exactly. Every section is checked against its source: changing, adding or dropping any word, number, punctuation mark or symbol (a footnote asterisk, "#3", a "______" fill-in blank), reordering text, splitting or merging words ("can not" to "cannot"; only a word split across a line break may be re-joined), merging numbers ("1 0" to "10") or removing a hyphen that isn't a word split across a line ("1-2", "ten-foot") gets that section rejected, and it keeps its cleaned version. The model may not drop anything: cleanup has already removed page numbers, headers and footers. Accepted output is cached by content, so the same text is never sent to the model twice, and cached or saved AI output is re-checked against the current rules: anything that no longer passes is formatted again, or (for a saved page) the reader shows the cleaned text with a notice and a Reformat button. One page can only be AI formatted once at a time. To find every outdated AI page in a book, click **Check AI pages** on the book in the Sources list: it lists the pages that fail the current check or were made from older cleaned text, and **Reformat all** reformats them one at a time (pages where the AI still can't format part of the text are left for you to decide on in the reader). Without a downloaded model the app works normally and the reader explains how to download one in Settings.
 
 ### Setting up AI formatting (per computer)
 
 AI settings are stored per computer, in `settings.json` in the app data folder. One machine can keep its models on the system drive and another on a second or companion drive. Everything is set in the app under **Settings**:
 
-1. Install [Ollama](https://ollama.com), in any folder or on any drive. Codex Engine finds it automatically, or you can pick `ollama.exe` with **Browse…**.
-2. Choose a **model storage folder** with room for models (about 1–5 GB each), e.g. `D:\ollama\models`.
-3. Click **Download** to fetch a model (default `qwen2.5:1.5b`). Progress shows in the panel.
+1. Choose **Local model inside Codex Engine** as the formatting provider.
+2. Choose a **model storage folder** with at least 1.2 GB free, or leave it blank to use Codex Engine’s data folder.
+3. Click **Download model** to fetch the pinned Qwen 2.5 1.5B Instruct Q4_K_M model (about 1.1 GB) from its publisher on Hugging Face. Download progress appears in Settings. The size and SHA-256 must match before it can run.
 
-By default **Codex Engine runs Ollama itself** (`ollama serve` with `OLLAMA_MODELS` set to your folder). It runs on its own port (11435), so it never conflicts with an Ollama you run separately, and it stops when the app closes. On Windows, Ollama and its model runners sit in a Job Object, so they also stop if the backend crashes. If the app window crashes or is ended from Task Manager, the backend notices and stops too, taking Ollama with it, so the next launch never finds an old backend still holding the library. If the model folder's drive isn't connected, or Ollama isn't installed yet, the app says so and keeps working without AI; it tries again (at most every 10 seconds) the next time AI is needed, so plugging the drive in or installing Ollama needs no restart. Saving Settings restarts Ollama only when a setting it runs with changed (not for a different model). Elsewhere than Windows, a crashed backend's Ollama is cleaned up the next time the app starts.
+**Only Codex Engine needs installing.** Windows builds include the portable llama.cpp CPU runtime and its libraries. Users do not install Ollama, Python, or a separate model app. Once the model is downloaded, local formatting runs offline. Downloads are explicit; app startup never downloads anything. Existing Ollama model files are not GGUF downloads and are not moved or deleted; the app prompts for its own verified model instead.
 
-Alternatively, choose **I run Ollama myself** and enter its address (default `http://127.0.0.1:11434`, or another machine on your network).
+The runtime binds only to an available loopback port, requires a randomly generated per-run API token, has no Web UI, and stops when the app stops. On Windows a Job Object also ends it if the backend crashes. Changing its model folder or disabling local AI stops the runtime and cancels affected jobs. Interrupted or invalid model downloads never replace a verified model.
 
-Developer overrides (environment variables, take precedence over Settings):
+Developer overrides:
 
 - `CODEX_ENGINE_SETTINGS`: path of the settings file
-- `CODEX_ENGINE_OLLAMA_URL`: use this Ollama and don't manage one
-- `CODEX_ENGINE_OLLAMA_MODEL`: model to use
-- `CODEX_ENGINE_AI_SECTION_CHARS` (default 3000), `CODEX_ENGINE_AI_NUM_CTX` (8192), `CODEX_ENGINE_AI_TIMEOUT` (300 s), `CODEX_ENGINE_AI_TEMPERATURE` (0), `CODEX_ENGINE_AI_RETRY_TEMPERATURE` (0.3), `CODEX_ENGINE_AI_ATTEMPTS` (4)
+- `CODEX_ENGINE_DATA_DIR`: alternate data/log/runtime-state folder for isolated development and tests
+- `CODEX_ENGINE_LOCAL_RUNTIME_DIR`: folder containing the portable `llama-server` runtime (the desktop shell supplies its bundled location)
+- `CODEX_ENGINE_AI_SECTION_CHARS` (default 3000), `CODEX_ENGINE_AI_TEMPERATURE` (0), `CODEX_ENGINE_AI_RETRY_TEMPERATURE` (0.3), `CODEX_ENGINE_AI_ATTEMPTS` (4)
+
+For a source checkout on Windows, run `python scripts/prepare-local-runtime.py` once. This downloads the pinned official Windows x64 CPU release, verifies the archive’s SHA-256, and stages it under `resources/llama`. Packaging runs this verification automatically and includes the upstream runtime license. Linux/macOS source development can provide a compatible runtime through the folder override; the shipped package currently targets Windows x64.
 
 Note for development on Windows: if the backend runs on a Microsoft Store Python (as the dev `.venv` here does), Windows redirects its app data (database, settings, logs) to `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.*\LocalCache\Local\Codex Engine`. The packaged app uses the normal `%LOCALAPPDATA%\Codex Engine`.
 
@@ -143,3 +145,5 @@ There are still two processes internally: the Electron UI process and the Python
 
 The backend only listens on this computer (it refuses any non-loopback `--host`), and the window only ever shows the app itself: dropped files, links and pop-ups can't navigate it elsewhere, the page may only run its own scripts (a Content-Security-Policy), and the desktop features (file pickers, uninstall) answer only the app's own page. Uninstalling from Settings asks for confirmation in a native dialog.
 
+
+DeepSeek cost confirmation is enabled by default. Every page that needs a paid call gets a local-only estimate using a dated official pricing snapshot, with a higher estimate for the response limit and one possible retry. Estimates are not guaranteed bills or spending caps; unknown model pricing is shown explicitly. The backend requires a single-use approval bound to the current page content, provider key, model and regeneration setting. Cached results and keeping cleaned text need no paid-call confirmation. Users may disable cost confirmations in Settings; DeepSeek itself remains separately opt-in. The bundled Windows runtime includes app-local Microsoft C++ runtime DLLs staged from the build host’s Visual Studio redistributable folder, so end users need no separate C++ runtime installer.

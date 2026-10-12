@@ -92,6 +92,7 @@ class PageRow(BaseModel):
 
 
 class AIFormatArgs(BaseModel):
+    cost_approval: str | None = Field(default=None, max_length=100)
     model: str | None = None
     force: bool = False  # bypass the cache and ask the model again
     # After "couldn't format some sections": the user chose to keep the cleaned text for them.

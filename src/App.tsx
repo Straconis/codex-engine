@@ -518,7 +518,7 @@ export default function App() {
       setReaderView(data.best);
       if (data.ai_error && !data.pending) setAiNotice(data.ai_error);
     } catch (e: any) {
-      // 409 = cancelled by the user; 503 = Ollama not running / no model. The reader keeps working.
+      // 409 = cancelled by the user; 503 = local model unavailable. The reader keeps working.
       const message = String(e).replace(/^Error: /, "");
       uiLog(`ai_format failed source=${sourceId} page=${page} ${message}`);
       finish(/^Cancelled/.test(message) ? "cancelled" : "error", message);
@@ -1357,8 +1357,8 @@ export default function App() {
                   aiBusy
                     ? "One page at a time. You can keep reading while it runs."
                     : aiStatus?.available
-                    ? `Format this page with ${aiStatus.model} (runs locally in Ollama; never rewrites the text)`
-                    : aiStatus?.error ?? "Checking for Ollama…"
+                    ? `Format this page with ${aiStatus.model} (${aiStatus.mode === "deepseek" ? "paid DeepSeek API; sends page text to DeepSeek" : "runs locally inside Codex Engine"}; wording is checked)`
+                    : aiStatus?.error ?? "Checking AI formatting…"
                 }
               >
                 {aiBusy && aiRun!.sourceId === reader.sourceId && aiRun!.page === reader.page

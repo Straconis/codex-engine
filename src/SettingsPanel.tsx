@@ -1,17 +1,18 @@
+import DeepSeekGuide from "./DeepSeekGuide";
 import { useEffect, useState } from "react";
 import { api, type AIStatus, type AppSettings, type ModelPull } from "./api";
 
-// Per-machine AI settings. Codex Engine can run Ollama itself, storing models wherever
-// this computer has room (system drive, second drive, companion/external drive).
+// Per-machine model storage and optional user-funded cloud formatting.
 
 const STATE_TEXT: Record<AIStatus["state"], string> = {
   idle: "Not started yet",
-  starting: "Starting Ollama…",
-  running: "Running (managed by Codex Engine)",
-  external: "Using your own Ollama",
+  starting: "Loading local model…",
+  running: "Local model running inside Codex Engine",
+  external: "Cloud formatting configured",
   off: "AI formatting is off",
-  not_installed: "Ollama not found",
+  not_installed: "Local runtime missing",
   error: "Problem",
+  missing_model: "Download a local model to get started",
 };
 
 function formatBytes(n: number) {
@@ -47,10 +48,13 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
   const [settingsPath, setSettingsPath] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [downloadName, setDownloadName] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [removeKey, setRemoveKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState("");
 
   const canBrowse = Boolean(window.codexEngine?.pickFolder);
-  const dirty = Boolean(saved && draft && JSON.stringify(saved) !== JSON.stringify(draft));
+  const dirty = Boolean(apiKey || removeKey || (saved && draft && JSON.stringify(saved) !== JSON.stringify(draft)));
   const pulling = Boolean(pull && !pull.done);
 
   useEffect(() => {
@@ -60,7 +64,6 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
         setSaved(settings);
         setDraft(settings);
         setSettingsPath(path);
-        setDownloadName(settings.model);
       })
       .catch((e: any) => setError(`Couldn't load settings: ${String(e)}`));
     refreshStatus();
@@ -70,7 +73,7 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     api.aiStatus().then(onStatus).catch(() => undefined);
   }
 
-  // Ollama may still be starting when the panel opens (e.g. right after app launch):
+  // The local model may still be loading when the panel opens:
   // keep checking until it settles, so the panel never shows a stale "starting".
   const settling = !status || status.state === "idle" || status.state === "starting";
   useEffect(() => {
@@ -88,12 +91,6 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     if (picked) set("models_dir", picked);
   }
 
-  async function browseOllama() {
-    const picked = await window.codexEngine?.pickFile?.(draft?.ollama_path || status?.ollama_path || "");
-    if (picked) set("ollama_path", picked);
-  }
-
-  // Returns the AI status once Ollama has settled with the saved settings, or null on error.
   async function save(): Promise<AIStatus | null> {
     if (!draft || !saved) return null;
     const changes = Object.fromEntries(
@@ -102,10 +99,13 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
     setSaving(true);
     setError("");
     try {
-      const { settings } = await api.updateSettings(changes);
+      const { settings } = await api.updateSettings({ ...changes, ...(apiKey || removeKey ? { deepseek_api_key: removeKey ? "" : apiKey.trim() } : {}) });
       setSaved(settings);
       setDraft(settings);
-      // The backend has stopped the old Ollama; wait for the new one (new folder/port) to settle.
+      setApiKey("");
+      setRemoveKey(false);
+      setTestResult("");
+      // Wait for a changed local model to finish loading.
       let s = await api.aiStatus();
       for (let i = 0; i < 30 && (s.state === "idle" || s.state === "starting"); i++) {
         onStatus(s);
@@ -125,35 +125,17 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
   // With unsaved changes this is "Save & download": settings are saved first so the
   // model lands in the folder shown above, not the previously saved one.
   async function download() {
-    const name = downloadName.trim();
-    if (!name) return;
+    if (!draft) return;
     setError("");
-    if (dirty) {
-      const s = await save();
-      if (!s) return;
-      if (s.state !== "running" && s.state !== "external") {
-        setError(`Settings saved, but Ollama isn't running, so the download didn't start. ${s.error ?? ""}`.trim());
-        return;
-      }
-    }
+    if (dirty && !(await save())) return;
     try {
-      await api.pullModel(name);
-    } catch (e: any) {
-      setError(String(e).replace(/^Error: /, ""));
-    }
+      const result = await api.pullModel(draft.local_model);
+      onStatus({ ...(status ?? { available: false, models: [], model: null, error: null, state: "missing_model", mode: "local", url: "", models_dir: "", pull: null }), pull: result });
+    } catch (e: any) { setError(String(e).replace(/^Error: /, "")); }
   }
 
-  const ollamaReady = status?.state === "running" || status?.state === "external";
-  const downloadBlocked = pulling || dirty
-    ? ""
-    : !ollamaReady
-    ? status?.state === "starting" || status?.state === "idle"
-      ? "Waiting for Ollama to start…"
-      : "Ollama isn't running, see the status above."
-    : "";
-
   const installed = status?.models ?? [];
-  const modelOptions = draft && !installed.includes(draft.model) ? [draft.model, ...installed] : installed;
+  const catalog = status?.catalog ?? [{ id: "qwen2.5-1.5b-instruct-q4_k_m", label: "Qwen 2.5 1.5B Instruct (Q4_K_M, about 1.1 GB)", size: 1117320736 }];
   const pct = pull && pull.total ? Math.min(100, Math.round((pull.completed / pull.total) * 100)) : 0;
 
   return (
@@ -168,8 +150,8 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
 
         <div className="modalBody settingsBody">
           <div className={`aiState state-${status?.state ?? "idle"}`}>
-            <b>AI formatting: {status ? STATE_TEXT[status.state] : "Checking…"}</b>
-            {status?.state === "running" || status?.state === "external" ? (
+            <b>AI formatting: {status?.mode === "deepseek" && status.available ? "DeepSeek configured (connection not yet checked)" : status ? STATE_TEXT[status.state] : "Checking…"}</b>
+            {status?.mode === "local" && status.state === "running" ? (
               <span>
                 {" "}
                 · {installed.length} model{installed.length === 1 ? "" : "s"} installed
@@ -185,125 +167,88 @@ export default function SettingsPanel({ status, pull, onClose, onStatus, general
             <>
               <label className="chk">
                 <input type="checkbox" checked={draft.ai_enabled} onChange={(e) => set("ai_enabled", e.target.checked)} />
-                Use local AI to format pages (optional; everything else works without it)
+                Use AI to format pages (optional; everything else works without it)
               </label>
 
-              <fieldset className="settingsGroup" disabled={!draft.ai_enabled}>
-                <legend>Ollama</legend>
-                <label className="radio">
-                  <input type="radio" checked={draft.manage_ollama} onChange={() => set("manage_ollama", true)} />
-                  Codex Engine runs Ollama for me (recommended)
-                </label>
-                <label className="radio">
-                  <input type="radio" checked={!draft.manage_ollama} onChange={() => set("manage_ollama", false)} />
-                  I run Ollama myself
-                </label>
-
-                {draft.manage_ollama ? (
-                  <>
-                    <div className="field">
-                      <span>Model storage folder</span>
-                      <div className="row">
-                        <input
-                          className="input"
-                          value={draft.models_dir}
-                          onChange={(e) => set("models_dir", e.target.value)}
-                          placeholder="Ollama's default folder on this computer"
-                        />
-                        {canBrowse && (
-                          <button className="btn small" onClick={browseFolder}>
-                            Browse…
-                          </button>
-                        )}
-                      </div>
-                      <div className="hint">
-                        Models are large (about 1–5 GB each). Pick a drive with room, such as a second or companion drive
-                        (e.g. D:\ollama\models). Each computer keeps its own setting.
-                      </div>
-                    </div>
-                    <div className="field">
-                      <span>Ollama program</span>
-                      <div className="row">
-                        <input
-                          className="input"
-                          value={draft.ollama_path}
-                          onChange={(e) => set("ollama_path", e.target.value)}
-                          placeholder={status?.ollama_path ? `Auto-detected: ${status.ollama_path}` : "Auto-detect"}
-                        />
-                        {canBrowse && (
-                          <button className="btn small" onClick={browseOllama}>
-                            Browse…
-                          </button>
-                        )}
-                      </div>
-                      {status?.state === "not_installed" && (
-                        <div className="hint">Install Ollama from ollama.com (any folder or drive), then pick it here if it isn't found automatically.</div>
-                      )}
-                    </div>
-                    <div className="field narrow">
-                      <span>Port</span>
-                      <input
-                        className="input"
-                        type="number"
-                        min={1024}
-                        max={65535}
-                        value={draft.managed_port}
-                        onChange={(e) => set("managed_port", Number(e.target.value))}
-                      />
-                    </div>
-                  </>
-                ) : (
+              <div className="field">
+                <span>Formatting provider</span>
+                <select className="input" value={draft.ai_provider} onChange={(e) => set("ai_provider", e.target.value as AppSettings["ai_provider"])}>
+                  <option value="local">Local model inside Codex Engine (no API charges)</option>
+                  <option value="deepseek">DeepSeek (your API account and billing)</option>
+                </select>
+              </div>
+              <DeepSeekGuide />
+              {draft.ai_provider === "deepseek" && (
+                <fieldset className="settingsGroup">
+                  <legend>DeepSeek API</legend>
+                  <div className="readerError" role="note">
+                    <b>Paid service: you pay DeepSeek directly.</b> API usage is billed for text sent and generated, including automatic retries and regeneration.
+                    Free chat access does not make the API free. Codex Engine provides no credits or billing cap.
+                    Formatting sends page text to DeepSeek over the internet; only enable it for text you are comfortable sending.
+                  </div>
+                  <label className="chk">
+                    <input type="checkbox" checked={draft.deepseek_enabled} onChange={(e) => set("deepseek_enabled", e.target.checked)} />
+                    Enable DeepSeek — I understand the charges and that page text is sent to DeepSeek
+                  </label>
+                  <div className="hint">Off by default. Adding a key does not enable it. Changes apply when you click Save. Turn this off and Save to stop further requests; charges already incurred remain payable.</div>
+                  <label className="chk">
+                    <input type="checkbox" checked={draft.deepseek_confirm_cost} onChange={(e) => set("deepseek_confirm_cost", e.target.checked)} />
+                    Show a cost estimate and ask before each DeepSeek formatting run (recommended)
+                  </label>
+                  <div className="hint">On by default. Estimates use a dated pricing snapshot and approximate token counts, including a higher estimate for retries. They are not a guaranteed bill or spending cap. Turn this off and Save to run without cost prompts, including book-wide reformatting.</div>
                   <div className="field">
-                    <span>Ollama address</span>
-                    <input className="input" value={draft.external_url} onChange={(e) => set("external_url", e.target.value)} />
-                    <div className="hint">Usually http://127.0.0.1:11434. Can be another computer on your network.</div>
+                    <span>API key</span>
+                    <input className="input" type="password" autoComplete="off" spellCheck={false} value={apiKey}
+                      onChange={(e) => { setApiKey(e.target.value); setRemoveKey(false); setTestResult(""); }}
+                      placeholder={draft.deepseek_has_key ? "Key saved — enter a replacement or leave blank to keep it" : "Paste your DeepSeek API key"} />
+                    <div className="hint">Encrypted for this Windows account. The saved key is never displayed. Each computer needs its own setup.</div>
+                    {draft.deepseek_has_key && <label className="chk"><input type="checkbox" checked={removeKey} onChange={(e) => { setRemoveKey(e.target.checked); setApiKey(""); }} />Remove the saved key when I Save</label>}
                   </div>
-                )}
-              </fieldset>
-
-              <fieldset className="settingsGroup" disabled={!draft.ai_enabled}>
-                <legend>Model</legend>
+                  <div className="field">
+                    <span>DeepSeek model</span>
+                    <input className="input" value={draft.deepseek_model} onChange={(e) => set("deepseek_model", e.target.value)} />
+                    <div className="hint">Default: deepseek-flash. Check current availability and pricing in the guide.</div>
+                  </div>
+                  <button className="btn small" disabled={saving || testing || (!apiKey && (!draft.deepseek_has_key || removeKey))} onClick={async () => {
+                    setTesting(true); setError(""); setTestResult("");
+                    try {
+                      if (dirty && !(await save())) return;
+                      const result = await api.testDeepSeek();
+                      setTestResult(`${result.available ? "Key accepted; account has API credit." : "Key accepted; insufficient API credit. Set up billing before formatting."} ${result.balance}`);
+                    } catch (e: any) { setError(String(e).replace(/^Error: /, "")); }
+                    finally { setTesting(false); }
+                  }}>{testing ? "Checking…" : dirty ? "Save & test API key" : "Test API key"}</button>
+                  <div className="hint">Checks your account balance without sending book text or generating a paid reply. It does not test formatting quality or model access.</div>
+                  {testResult && <div className="hint" role="status">{testResult}</div>}
+                </fieldset>
+              )}
+              {draft.ai_provider === "local" && <fieldset className="settingsGroup">
+                <legend>Local model</legend>
+                <p>Codex Engine includes the model runtime. Download a model here once, then format pages offline. You do not need to install Ollama, Python, or another model app.</p>
                 <div className="field">
-                  <span>Use this model for formatting</span>
-                  <select className="input" value={draft.model} onChange={(e) => set("model", e.target.value)}>
-                    {modelOptions.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                        {installed.includes(m) ? "" : " (not downloaded)"}
-                      </option>
-                    ))}
-                  </select>
-                  <div className="hint">Small models (1–3B) are fast and light. Output that changes the book's wording is always rejected.</div>
-                </div>
-                <div className="field">
-                  <span>Download a model</span>
+                  <span>Model storage folder</span>
                   <div className="row">
-                    <input className="input" value={downloadName} onChange={(e) => setDownloadName(e.target.value)} placeholder="qwen2.5:1.5b" />
-                    <button
-                      className="btn small"
-                      onClick={download}
-                      disabled={pulling || saving || Boolean(downloadBlocked)}
-                      title={downloadBlocked || "Downloads into the model storage folder"}
-                    >
-                      {pulling ? "Downloading…" : saving ? "Saving…" : dirty ? "Save & download" : "Download"}
-                    </button>
+                    <input className="input" value={draft.models_dir} onChange={(e) => set("models_dir", e.target.value)} placeholder={status?.models_dir || "Codex Engine’s data folder"} />
+                    {canBrowse && <button className="btn small" onClick={browseFolder} disabled={pulling}>Browse…</button>}
                   </div>
-                  {downloadBlocked && <div className="hint">{downloadBlocked}</div>}
-                  {!downloadBlocked && dirty && !pulling && (
-                    <div className="hint">You have unsaved changes. They'll be saved first, so the model is stored in the folder shown above.</div>
-                  )}
-                  {pull && (
-                    <div className="pullProgress">
-                      <div className="barOuter">
-                        <div className="barInner" style={{ width: `${pull.done && !pull.error ? 100 : pct}%` }} />
-                      </div>
-                      <div className="hint">
-                        {pull.model}: {pull.error ? `failed: ${pull.error}` : pull.done ? "downloaded" : `${pull.status} ${formatBytes(pull.completed)} / ${formatBytes(pull.total)}`}
-                      </div>
-                    </div>
-                  )}
+                  <div className="hint">Choose a drive with at least 1.2 GB free for the model. Changing folders does not move an existing model; download it into the new folder.</div>
                 </div>
-              </fieldset>
+                <div className="field">
+                  <span>Use this local model</span>
+                  <select className="input" value={draft.local_model} onChange={(e) => set("local_model", e.target.value)}>
+                    {catalog.map((m) => <option key={m.id} value={m.id}>{m.label}{installed.includes(m.id) ? " — downloaded" : " — download needed"}</option>)}
+                  </select>
+                  <div className="hint">Runs on your CPU. Formatting keeps the book’s words; replies that change them are rejected.</div>
+                  <button className="btn small" onClick={download} disabled={pulling || saving || (!dirty && installed.includes(draft.local_model))}>
+                    {pulling ? "Downloading…" : saving ? "Saving…" : dirty ? "Save & download model" : installed.includes(draft.local_model) ? "Model downloaded" : "Download model"}
+                  </button>
+                  <div className="hint">Downloads the model from its publisher on Hugging Face and verifies its checksum before use. No book text is sent. Downloads require internet; local formatting does not.</div>
+                  {pull && <div className="pullProgress">
+                    <div className="barOuter"><div className="barInner" style={{ width: `${pull.done && !pull.error ? 100 : pct}%` }} /></div>
+                    <div className="hint" role="status">{pull.error ? pull.error : pull.done ? "Model downloaded and verified." : `${pull.status}: ${formatBytes(pull.completed)} / ${formatBytes(pull.total)}`}</div>
+                  </div>}
+                </div>
+              </fieldset>}
             </>
           )}
 

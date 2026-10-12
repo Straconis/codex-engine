@@ -1,7 +1,7 @@
 {
   "name": "codex-engine",
   "private": true,
-  "version": "0.3.13",
+  "version": "0.3.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,10 @@
     "package:dir": "electron-builder --win dir",
     "installer:inno": "powershell -ExecutionPolicy Bypass -File scripts/build-installer-inno.ps1",
     "dist:win:inno": "powershell -ExecutionPolicy Bypass -File scripts/dist-win-inno.ps1",
-    "build:updater:win": "powershell -ExecutionPolicy Bypass -File scripts/build-updater-win.ps1"
+    "build:updater:win": "powershell -ExecutionPolicy Bypass -File scripts/build-updater-win.ps1",
+    "prepare:local-runtime": "python scripts/prepare-local-runtime.py",
+    "prepackage:dir": "python scripts/prepare-local-runtime.py",
+    "prepackage:win": "python scripts/prepare-local-runtime.py"
   },
   "dependencies": {
     "react": "^19.1.0",
@@ -50,6 +53,10 @@
       {
         "from": "resources/updater",
         "to": "updater"
+      },
+      {
+        "from": "resources/llama",
+        "to": "llama"
       }
     ],
     "win": {

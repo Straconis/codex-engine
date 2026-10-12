@@ -9,17 +9,27 @@ import json
 import os
 import re
 import threading
+from typing import Literal
 from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .platforming import app_data_dir
+from .secrets import protect, unprotect
+from .local_catalog import DEFAULT_MODEL, CATALOG
 
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 
 
 class AppSettings(BaseModel):
     ai_enabled: bool = True
+    ai_provider: Literal["local", "deepseek"] = "local"
+    local_model: str = DEFAULT_MODEL
+    deepseek_enabled: bool = False
+    deepseek_confirm_cost: bool = True
+    deepseek_model: str = "deepseek-flash"
+    deepseek_key_encrypted: str = Field(default="", exclude=True, repr=False)
+
     # True: Codex Engine starts and stops its own Ollama (with the folder/port below).
     # False: connect to an Ollama the user runs themselves at external_url.
     manage_ollama: bool = True
@@ -29,7 +39,26 @@ class AppSettings(BaseModel):
     external_url: str = "http://127.0.0.1:11434"
     model: str = "qwen2.5:1.5b"
 
-    @field_validator("model")
+    @property
+    def deepseek_api_key(self) -> str:
+        return unprotect(self.deepseek_key_encrypted) if self.deepseek_key_encrypted else ""
+
+    def public(self) -> dict:
+        return {**self.model_dump(), "deepseek_has_key": bool(self.deepseek_key_encrypted)}
+
+    @field_validator("ai_provider", mode="before")
+    @classmethod
+    def _old_provider(cls, value):
+        return "local" if value == "ollama" else value
+
+    @field_validator("local_model")
+    @classmethod
+    def _local_model(cls, value):
+        if value not in CATALOG:
+            raise ValueError("Choose a supported local model from Settings.")
+        return value
+
+    @field_validator("model", "deepseek_model")
     @classmethod
     def _model_name(cls, value: str) -> str:
         value = value.strip()
@@ -105,9 +134,19 @@ class SettingsStore:
         instead of being erased by an unrelated change.
         """
         with self._lock:
+            changes = dict(changes)
+            changes.pop("deepseek_has_key", None)
+            if "deepseek_key_encrypted" in changes:
+                raise ValueError("Use the API key field to replace the key.")
+            key_supplied = "deepseek_api_key" in changes
+            key = changes.pop("deepseek_api_key", "")
+            if key_supplied and (not isinstance(key, str) or len(key) > 4096 or any(c.isspace() for c in key)):
+                raise ValueError("Enter an API key without spaces or line breaks.")
             checked = AppSettings(**changes)
             stored = self._stored()
             stored.update({key: getattr(checked, key) for key in changes if key in AppSettings.model_fields})
+            if key_supplied:
+                stored["deepseek_key_encrypted"] = protect(key) if key else ""
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(stored, indent=2), encoding="utf-8")

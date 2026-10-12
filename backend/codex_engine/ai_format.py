@@ -10,7 +10,7 @@ reorders or rewrites text is rejected and that section keeps its cleaned version
 Accepted output is cached by hash(prompt version, model, input), so the same text
 is never sent to the model twice.
 
-Book text never leaves the machine. The model and Ollama settings come from
+In local Ollama mode, book text never leaves the machine. The optional DeepSeek client sends sections to the hosted API only when explicitly enabled. The model and Ollama settings come from
 `AIConfig` (environment variables), and the HTTP client is swappable, so switching
 models or backends later doesn't touch the pipeline.
 """
@@ -665,6 +665,7 @@ def _format_section(
                 should_stop=hooks.should_stop,
             )
         )
+        hooks.check()
         try:
             check_faithful(section, reply)
         except AIFormatError as exc:
@@ -745,7 +746,9 @@ def format_markdown(
             continue
         formatted = _format_section(section, index, total, chosen, client, config, cache, force, result, hooks)
         out.append(_with_edges_of(section, formatted))
+    hooks.check()
     hooks.progress(total, total, 0)
+    hooks.check()
     rebuilt = "".join(sep + section for section, sep in parts)
     result.markdown = "".join(sep + section for (_, sep), section in zip(parts, out)) + text[len(rebuilt):]
     return result
